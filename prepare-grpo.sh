@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -e
+
 export HF_HOME=$PWD/.cache
 
 if [ -z "${HF_TOKEN:-}" ]; then
@@ -18,8 +20,18 @@ fi
 # Swap to local container path
 CONTAINER_IMAGE_PATH=./$CONTAINER_IMAGE_PATH
 
+export PATH="$PATH:$HOME/.local/bin"
+if ! command -v uv ; then
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+fi
+
 ## Fetch Gym dataset jsonl
 cd 3rdparty/Gym-workspace/Gym
+if [ ! -f .patched ]; then
+  patch -p1 --forward < ../../../0001-gym-almost-server-validation-error.patch
+  touch .patched
+fi
+
 uv venv --python 3.12 --allow-existing .venv
 source .venv/bin/activate
 uv sync --active --extra dev
@@ -39,8 +51,11 @@ uv run ng_prepare_data "+config_paths=[${config_paths}]" \
 deactivate
 cd ../../..
 
+if ! command -v hf ; then
+  curl -LsSf https://hf.co/cli/install.sh | bash
+fi
 ## Fetch Model
-hf download nvidia/NVIDIA-Nemotron-Nano-9B-v2
+uvx hf download nvidia/NVIDIA-Nemotron-Nano-9B-v2
 
 # this is evil but necessary
 tokenizer_config_path=$(find $PWD/.cache/hub/models--nvidia--NVIDIA-Nemotron-Nano-9B-v2 -name tokenizer_config.json)
