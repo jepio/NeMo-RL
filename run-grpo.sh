@@ -43,8 +43,4 @@ uv run python examples/nemo_gym/run_grpo_nemo_gym.py \
     ++policy.megatron_cfg.defer_fp32_logits=True \
     ++policy.logprob_batch_size=2 \
     ++loss_fn.force_on_policy_ratio=True \
-    ++checkpointing.checkpoint_dir=results/$EXP_NAME &> results/$EXP_NAME/output.log &
-
-# Watch the logs
-tail -f results/$EXP_NAME/output.log
-
+    ++checkpointing.checkpoint_dir=results/$EXP_NAME 2>&1 | tee results/$EXP_NAME/output.log
