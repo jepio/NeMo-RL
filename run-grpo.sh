@@ -20,11 +20,13 @@ CONFIG_PATH=examples/nemo_gym/grpo_workplace_assistant_nemotron_nano_v2_9b.yaml
 # Set these environment variables before running:
 #   WANDB_API_KEY: Your Weights & Biases API key for logging
 #   logger.wandb.project: Fill in your username
-TORCH_CUDA_ARCH_LIST="9.0 10.0" \
-HF_HOME=$PWD/.cache/ \
+#
 # This is the original, needed to be patched for vllm 0.17.1 compat
 # ++policy.generation.vllm_cfg.tool_parser_plugin=$(find $PWD/.cache -name nemotron_toolcall_parser_no_streaming.py)
 # ++grpo.max_num_steps=3
+
+TORCH_CUDA_ARCH_LIST="9.0 10.0" \
+HF_HOME=$PWD/.cache/ \
 uv run python examples/nemo_gym/run_grpo_nemo_gym.py \
     --config=$CONFIG_PATH \
     ++logger.log_dir=results/$EXP_NAME \
