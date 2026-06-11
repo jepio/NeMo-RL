@@ -35,7 +35,7 @@ uv run python examples/nemo_gym/run_grpo_nemo_gym.py \
     ++grpo.max_num_steps=20 \
     ++grpo.max_num_epochs=1 \
     ++grpo.val_period=5 \
-    ++grp.val_at_end=true \
+    ++grpo.val_at_end=true \
     ++checkpointing.save_period=19 \
     ++checkpointing.save_optimizer=False \
     ++policy.sequence_packing.enabled=True \
