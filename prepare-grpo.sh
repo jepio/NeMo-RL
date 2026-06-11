@@ -2,6 +2,11 @@
 
 export HF_HOME=$PWD/.cache
 
+if [ -z "${HF_TOKEN:-}" ]; then
+  echo >&2 "set HF_TOKEN"
+  exit 1
+fi
+
 git submodule update --init --recursive
 
 ## Prepare container image
@@ -19,6 +24,9 @@ uv venv --python 3.12 --allow-existing .venv
 source .venv/bin/activate
 uv sync --active --extra dev
 
+if [ ! -f env.yaml ]; then
+  echo "hf_token: ${HF_TOKEN}" >env.yaml
+fi
 # aligned with the training we are going to be doing
 config_paths="responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,\
 resources_servers/workplace_assistant/configs/workplace_assistant.yaml"
