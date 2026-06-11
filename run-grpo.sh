@@ -38,6 +38,8 @@ uv run python examples/nemo_gym/run_grpo_nemo_gym.py \
     ++grpo.val_at_end=true \
     ++checkpointing.save_period=19 \
     ++checkpointing.save_optimizer=False \
+    ++policy.megatron_cfg.empty_unused_memory_level=1 \
+    ++policy.generation.vllm_cfg.gpu_memory_utilization=0.75 \
     ++policy.sequence_packing.enabled=True \
     ++policy.dynamic_batching.enabled=False \
     ++policy.megatron_cfg.defer_fp32_logits=True \
