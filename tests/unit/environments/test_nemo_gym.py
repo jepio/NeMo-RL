@@ -79,6 +79,42 @@ def test_detect_invalid_tool_call_flags_textual_tool_call_patterns():
     )
 
 
+def test_detect_invalid_tool_call_for_malformed_structured_arguments():
+    assert _detect_invalid_tool_call(
+        {
+            "type": "function_call",
+            "name": "analytics_create_plot",
+            "arguments": '{"time_min": "2023-11-24\n"}',
+        }
+    )
+
+
+def test_detect_invalid_tool_call_allows_valid_structured_arguments():
+    assert not _detect_invalid_tool_call(
+        {
+            "type": "function_call",
+            "name": "analytics_create_plot",
+            "arguments": '{"time_min": "2023-11-24"}',
+        }
+    )
+
+
+def test_detect_invalid_tool_call_flags_nemotron_toolcall_text():
+    assert _detect_invalid_tool_call(
+        {
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": (
+                        '<TOOLCALL>[{"name": "analytics_create_plot", '
+                        '"arguments": {"time_min": "2023-11-24\n"}}]</TOOLCALL>'
+                    ),
+                }
+            ]
+        }
+    )
+
+
 @pytest.fixture(scope="function")
 def nemo_gym_vllm_generation(cluster, nemo_gym_tokenizer):  # noqa: F811
     generation_config = deepcopy(basic_vllm_test_config)

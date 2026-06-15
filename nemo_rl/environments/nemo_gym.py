@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, TypedDict
 
@@ -27,6 +28,8 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</tool_call>",
     "<function_call>",
     "</function_call>",
+    "<TOOLCALL>",
+    "</TOOLCALL>",
 ]
 
 
@@ -39,6 +42,23 @@ class NemoGymConfig(TypedDict):
     ]  # Substrings in assistant text content that indicate an invalid tool call
 
 
+def _has_malformed_function_call_arguments(output_item_dict: dict[str, Any]) -> bool:
+    """Return whether a structured function_call has malformed JSON arguments."""
+    if output_item_dict.get("type") != "function_call":
+        return False
+
+    arguments = output_item_dict.get("arguments")
+    if not isinstance(arguments, str):
+        return True
+
+    try:
+        json.loads(arguments)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return True
+
+    return False
+
+
 def _detect_invalid_tool_call(
     output_item_dict: dict[str, Any],
     invalid_tool_call_patterns: list[str] | None = None,
@@ -47,16 +67,17 @@ def _detect_invalid_tool_call(
     invalid_tool_call_patterns = (
         invalid_tool_call_patterns or DEFAULT_INVALID_TOOL_CALL_PATTERNS
     )
+    is_invalid_tool_call = _has_malformed_function_call_arguments(output_item_dict)
 
     if (
         "content" not in output_item_dict
         or len(output_item_dict["content"]) == 0
         or "text" not in output_item_dict["content"][0]
     ):
-        return False
+        return is_invalid_tool_call
 
     assistant_message_content = output_item_dict["content"][0]["text"]
-    return any(
+    return is_invalid_tool_call or any(
         pattern in assistant_message_content for pattern in invalid_tool_call_patterns
     )
 
