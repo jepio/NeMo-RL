@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from pathlib import Path
-from typing import Any, Dict, List, TypedDict
+from typing import Any, Dict, List, NotRequired, TypedDict
 
 import ray
 import torch
@@ -22,11 +22,43 @@ from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.utils.timer import Timer
 
+DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
+    "<tool_call>",
+    "</tool_call>",
+    "<function_call>",
+    "</function_call>",
+]
+
 
 class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
     initial_global_config_dict: Dict[str, Any]
+    invalid_tool_call_patterns: NotRequired[
+        List[str] | None
+    ]  # Substrings in assistant text content that indicate an invalid tool call
+
+
+def _detect_invalid_tool_call(
+    output_item_dict: dict[str, Any],
+    invalid_tool_call_patterns: list[str] | None = None,
+) -> bool:
+    """Flag a NeMo-Gym output item as an invalid tool call."""
+    invalid_tool_call_patterns = (
+        invalid_tool_call_patterns or DEFAULT_INVALID_TOOL_CALL_PATTERNS
+    )
+
+    if (
+        "content" not in output_item_dict
+        or len(output_item_dict["content"]) == 0
+        or "text" not in output_item_dict["content"][0]
+    ):
+        return False
+
+    assistant_message_content = output_item_dict["content"][0]["text"]
+    return any(
+        pattern in assistant_message_content for pattern in invalid_tool_call_patterns
+    )
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -209,6 +241,14 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                     ),
                 }
             )
+            # Valid tool calls go through the structured API (tool_calls field) and get
+            # executed by NeMo-Gym. If tool call patterns appear in the text content instead,
+            # the call was invalid and never executed; flag it so training can penalize it.
+            is_invalid_tool_call = _detect_invalid_tool_call(
+                output_item_dict,
+                invalid_tool_call_patterns=self.cfg.get("invalid_tool_call_patterns"),
+            )
+
             nemo_rl_message_log.append(
                 {
                     "role": "assistant",
@@ -217,6 +257,7 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                     "generation_logprobs": torch.tensor(
                         output_item_dict["generation_log_probs"]
                     ),
+                    "is_invalid_tool_call": is_invalid_tool_call,
                 }
             )
 

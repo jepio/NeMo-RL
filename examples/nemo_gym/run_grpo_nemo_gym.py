@@ -207,9 +207,15 @@ The validation set you pass in will directly be used for validation with no addi
     is_trajectory_collection = (
         config["env"]["nemo_gym"].pop("is_trajectory_collection", False) or False
     )
+    # Pop NeMo-RL-side detection knobs out of the env dict so they reach
+    # NemoGymConfig as top-level fields and are not forwarded into NeMo-Gym.
+    invalid_tool_call_patterns = config["env"]["nemo_gym"].pop(
+        "invalid_tool_call_patterns", None
+    )
     nemo_gym_config = NemoGymConfig(
         model_name=policy_generation.cfg["model_name"],
         base_urls=policy_generation.dp_openai_server_base_urls,
+        invalid_tool_call_patterns=invalid_tool_call_patterns,
         initial_global_config_dict=config["env"]["nemo_gym"],
     )
     nemo_gym = create_env(env_name="nemo_gym", env_config=nemo_gym_config)

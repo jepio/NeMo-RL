@@ -167,6 +167,9 @@ class GRPOConfig(TypedDict):
     # Sequence-level logprob error masking for training stability. If set, mask sequences with mult_prob_error exceeding this threshold (same scale as token_mult_prob_error metric, e.g., 1.5)
     # Note that this is slightly different than Masked Importance Sampling (MIS) because this uses the absolute value of the difference between the training and generation logprobs, whereas MIS just uses the difference between the training and generation logprobs.
     seq_logprob_error_threshold: float | None
+    # Advantage value to assign to invalid tool call tokens. When set (e.g. -5.0), overwrites the
+    # computed advantage for those tokens to penalize them; absent/None disables the penalty.
+    invalid_tool_call_advantage: NotRequired[float | None]
     # Advantage estimator configuration (grpo or reinforce_plus_plus)
     adv_estimator: NotRequired[AdvEstimatorConfig]
 
@@ -1094,6 +1097,79 @@ def _extract_prompt_only_messages(message_logs: list) -> list:
     return prompt_only_message_logs
 
 
+def _resolve_invalid_tool_call_advantage(
+    master_config: MasterConfig,
+) -> float | None:
+    """Return configured invalid tool-call penalty and validate feature support."""
+    invalid_tool_call_advantage = master_config["grpo"].get(
+        "invalid_tool_call_advantage"
+    )
+    if invalid_tool_call_advantage is None:
+        return invalid_tool_call_advantage
+
+    # The is_invalid_tool_call flag is only populated by the NeMo-Gym path.
+    # Without that path the penalty would silently no-op, so fail loudly instead.
+    assert _should_use_nemo_gym(master_config), (
+        "grpo.invalid_tool_call_advantage requires the NeMo-Gym path "
+        "(env.should_use_nemo_gym=true); it is not supported with the native "
+        "generation path."
+    )
+    return invalid_tool_call_advantage
+
+
+def _apply_invalid_tool_call_advantage_penalty(
+    train_data: BatchedDataDict[ClippedPGLossDataDict],
+    message_logs: list[list[dict[str, Any]]],
+    invalid_tool_call_advantage: float | None,
+    log_config: bool = False,
+) -> None:
+    """Overwrite advantages for assistant-message spans flagged as invalid tool calls."""
+    if invalid_tool_call_advantage is None:
+        return
+
+    if log_config:
+        print(
+            f"Invalid tool call advantage: {invalid_tool_call_advantage}",
+            flush=True,
+        )
+
+    for i, message_log in enumerate(message_logs):
+        token_offset = 0
+        for j, message in enumerate(message_log):
+            token_ids = cast(torch.Tensor, message["token_ids"])
+            msg_len = len(token_ids)
+            is_invalid = (
+                message["role"] == "assistant"
+                and "generation_logprobs" in message
+                and message.get("is_invalid_tool_call", False)
+            )
+            if is_invalid:
+                print(
+                    f"Setting negative advantage ({invalid_tool_call_advantage}) for invalid tool call in assistant message {i} {j}",
+                    flush=True,
+                )
+                train_data["advantages"][i, token_offset : token_offset + msg_len] = (
+                    invalid_tool_call_advantage
+                )
+            token_offset += msg_len
+
+
+def _apply_configured_invalid_tool_call_advantage_penalty(
+    train_data: BatchedDataDict[ClippedPGLossDataDict],
+    message_logs: list[list[dict[str, Any]]],
+    master_config: MasterConfig,
+    log_config: bool = False,
+) -> None:
+    """Resolve config and apply invalid tool-call advantage penalties."""
+    invalid_tool_call_advantage = _resolve_invalid_tool_call_advantage(master_config)
+    _apply_invalid_tool_call_advantage_penalty(
+        train_data=train_data,
+        message_logs=message_logs,
+        invalid_tool_call_advantage=invalid_tool_call_advantage,
+        log_config=log_config,
+    )
+
+
 def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -1684,7 +1760,10 @@ def grpo_train(
                     # Add loss mask to each message in LLMMessageLogType
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
-                            if message["role"] == "assistant":
+                            if (
+                                message["role"] == "assistant"
+                                and "generation_logprobs" in message
+                            ):
                                 message["token_loss_mask"] = torch.ones_like(
                                     message["token_ids"]
                                 )
@@ -1800,6 +1879,10 @@ def grpo_train(
                         advantages=train_data["advantages"],
                     )
                     del baseline_for_log
+
+                    _apply_configured_invalid_tool_call_advantage_penalty(
+                        train_data, repeated_batch["message_log"], master_config
+                    )
 
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 print("▶ Preparing for training...", flush=True)
@@ -2745,7 +2828,10 @@ def async_grpo_train(
                     # Add loss mask to each message
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
-                            if message["role"] == "assistant":
+                            if (
+                                message["role"] == "assistant"
+                                and "generation_logprobs" in message
+                            ):
                                 message["token_loss_mask"] = torch.ones_like(
                                     message["token_ids"]
                                 )
@@ -2836,6 +2922,13 @@ def async_grpo_train(
                     advantages = train_data["advantages"]
                     print(
                         f"  📊 Advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
+                    )
+
+                    _apply_configured_invalid_tool_call_advantage_penalty(
+                        train_data,
+                        repeated_batch["message_log"],
+                        master_config,
+                        log_config=True,
                     )
 
                 print("▶ Preparing for training...")

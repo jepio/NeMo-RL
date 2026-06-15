@@ -36,6 +36,8 @@ grpo:
     target_max: 1.0
   skip_reference_policy_logprobs_calculation: true
   seq_logprob_error_threshold: null
+  # Advantage value assigned to invalid tool call tokens (e.g. -5.0 to penalize). null disables.
+  invalid_tool_call_advantage: null
 
   async_grpo:
     enabled: false # Set to true to enable async training mode
@@ -284,6 +286,9 @@ env:
   nemo_gym:  # This is passed into NeMo-Gym as the initial_global_config_dict
     rollout_max_attempts_to_avoid_lp_nan: 1
     is_trajectory_collection: false  # Set this to true to enable trajectory collection (no training). You may also want to increase `policy.generation.vllm_cfg.gpu_memory_utilization`
+    # Optional substrings used to flag invalid assistant tool-call turns for advantage
+    # penalties (see grpo.invalid_tool_call_advantage). Omit to use built-in defaults.
+    # invalid_tool_call_patterns: ["<tool_call>", "</tool_call>", "<function_call>", "</function_call>"]
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
     - resources_servers/workplace_assistant/configs/workplace_assistant.yaml

@@ -23,7 +23,12 @@ from yaml import safe_load
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
-from nemo_rl.environments.nemo_gym import NemoGym, NemoGymConfig, setup_nemo_gym_config
+from nemo_rl.environments.nemo_gym import (
+    NemoGym,
+    NemoGymConfig,
+    _detect_invalid_tool_call,
+    setup_nemo_gym_config,
+)
 from nemo_rl.models.generation.vllm import VllmGeneration
 
 # cluster and tokenizer are fixture imports
@@ -51,6 +56,26 @@ except ImportError:
 def test_nemo_gym_stub_module():
     print(
         f"NeMo-Gym test successfully run! NeMo-Gym config_types module: {config_types}"
+    )
+
+
+def test_detect_invalid_tool_call_flags_textual_tool_call_patterns():
+    assert _detect_invalid_tool_call(
+        {
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": 'I will call <tool_call>{"name":"foo"}</tool_call>',
+                }
+            ]
+        }
+    )
+    assert not _detect_invalid_tool_call(
+        {"content": [{"type": "output_text", "text": "plain answer"}]}
+    )
+    assert _detect_invalid_tool_call(
+        {"content": [{"type": "output_text", "text": "CUSTOM_TOOL"}]},
+        invalid_tool_call_patterns=["CUSTOM_TOOL"],
     )
 
 
