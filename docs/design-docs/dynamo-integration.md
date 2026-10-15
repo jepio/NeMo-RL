@@ -32,10 +32,15 @@ The connector also sets two vLLM options that matter across weight updates.
 `kv_load_failure_policy: recompute` turns a failed KV pull into a local prefill.
 `kv_lease_duration` (`dynamo_cfg.disaggregation.kv_lease_duration_s`) is how long
 a prefill engine keeps a finished request's KV for the decode engine. The decode
-scheduler renews it with heartbeats, and only while it steps. A refit pauses
-prefill first (see below), so no lease is open while decode is frozen. The lease
-then bounds only how long the prefill pause can wait, and it must stay below
-`control_timeout_s`.
+scheduler renews it with heartbeats, and only while it steps. A refit freezes the
+decode engines, so the lease runs on during the pause. A prefill engine frees the
+blocks when the lease ends, whether or not decode has read them, and a decode
+engine does not check the lease before it reads. A lease that ends first can
+therefore make decode use freed memory and wrong KV without an error. The lease
+must outlast the pause: setup requires at least twice `control_timeout_s`, and the
+SingleController requires at least twice (`refit_timeout_s` + 60 s), because it
+retries a failed refit once while the engines stay paused. A long lease only keeps
+the KV of a lost handoff allocated for longer.
 
 Startup completes only after the frontend sees the same fixed membership at
 the generation and RL endpoints for both the `backend` and `prefill`
@@ -102,37 +107,82 @@ cache mode determines where it runs.
 vLLM's layerwise reload materializes parameters while the update runs, so no
 request may execute beside it. The refit channel therefore pauses every engine,
 prefill and decode alike, through Dynamo's `pause_generation` route, which hands
-`mode` and `clear_cache` to vLLM's `pause_generation`. Two modes are used:
+`mode` and `clear_cache` to vLLM's `pause_generation`. Both trainers use the same
+pause:
 
-- **`keep`** (in-flight weight updates, `DynamoGeneration.pause_generation_for_refit`):
-  the scheduler stops stepping and keeps its requests. They continue on the new
-  weights after `resume_generation`. With `clear_cache`, vLLM also preempts the
-  running requests and clears the KV and prefix caches, so they recompute on the
-  new weights. vLLM raises if a preempted request is a decode request waiting on
-  remote KV, which is why that combination is rejected at setup for a
-  disaggregated fleet.
-- **`wait`** (`drain_for_weight_update`, used by the SingleController, and cache
-  invalidation): running requests finish on the old weights, new ones queue, and
-  caches are cleared once idle.
+- **In-flight refit** (`DynamoGeneration.pause_generation_for_refit` for the async
+  GRPO loop, `drain_for_weight_update` for the SingleController): `keep` mode. The
+  scheduler stops stepping and keeps its requests. They continue on the new
+  weights after `resume_generation`. The SingleController never clears the caches.
+  The async loop clears them only on an aggregated fleet with
+  `recompute_kv_cache_after_weight_updates`.
+- **Idle fleet** (`flush_cache`, after the async collector has drained every
+  trajectory): `wait` mode with a cache clear.
 
-On a prefill/decode fleet the order matters. A prefill engine keeps the KV of a
-finished request until a decode engine pulls it, and a paused decode engine pulls
-nothing, so pausing both at once stalls the prefill pause until the lease ends.
-The channel therefore pauses prefill engines first and waits for them while decode
-still steps and pulls the pending KV. Only then does it pause decode. Prefill
-always uses `wait`: in `keep` a chunked prefill would freeze in the middle of a
-prompt and finish on the new weights, so one prompt would carry KV from two
-weight versions. Resume goes the other way, decode first, so that prefill does
-not produce KV that nobody can pull. A fleet without prefill engines pauses all
-engines at once.
+All engines pause at the same time and resume decode first. The decode engines
+send the heartbeats that extend the KV leases, and a resumed prefill engine
+expires the leases that ended, so prefill must not resume first.
+
+Two rules protect a prefill/decode fleet, and the channel enforces both with a
+`ValueError` before it sends any request:
+
+- No cache clear. A prefill engine still holds KV for the decode engines, and
+  vLLM raises when a clear cannot free it.
+- No `wait` pause. A decode engine in `PAUSED_NEW` runs no waiting-request loop, so
+  it admits no request that waits for remote KV. The pause of a prefill engine then
+  waits for decode to admit its whole backlog, a time that grows with the backlog
+  and the generation length and can exceed `control_timeout_s`.
 
 If a pause fails on any engine, the channel resumes every engine before it
 raises, including the engine that failed, because a pause call that timed out can
 still finish later. Dynamo runs pause and resume under one lock, so the resume
 lands after that late pause. The rollback waits for twice the control timeout for
 the same reason. A failed refit therefore never leaves part of the fleet frozen.
-With `in_flight_weight_updates` off, the async collector drains its own
-trajectories instead and refits an idle fleet.
+
+`finish_generation()`, which the async trainers call after validation while
+rollouts can still be in flight, posts Dynamo's `flush_cache` route to every
+engine. This resets the prefix cache without a pause. vLLM keeps the blocks that a
+running request or a held lease still uses, so the reset can be partial. With
+`in_flight_weight_updates` off, the async collector drains its own trajectories
+instead and refits an idle fleet.
+
+A request stays open while the engines are frozen, so `request_timeout_s` must
+exceed the refit time. The SingleController checks this against its refit
+deadline.
+
+### vLLM source patch
+
+A pause in `keep` mode completes only when the engine core is idle. vLLM 0.29
+counts a prefill engine's finished requests as work while it holds their KV for a
+decode engine (`Scheduler.has_finished_requests()`). A paused decode engine pulls
+nothing, so the pause of a prefill engine waits for the KV lease. NeMo RL patches
+the installed vLLM source (`_patch_vllm_pause_with_held_kv` in
+`nemo_rl/models/generation/vllm/patches.py`) so that
+`has_finished_requests()` returns False in the `PAUSED_ALL` state for requests
+that the connector holds. A request that has just finished still counts, so it
+gets its flush step. The pause then completes after the last batch. The held
+blocks stay allocated. The paused prefill engine is idle, so it handles no
+notification and expires no lease until it resumes. The patch does not change
+`PAUSED_NEW`.
+
+TensorRT-LLM needs no such patch: each of its engines refits itself at a
+scheduler step boundary and never waits for KV transfers. The patch applies to
+vLLM 0.29.0 and has to be checked on each upgrade; vLLM main has the same code
+today. A refit that needs no pause at all is a possible alternative. The refit is
+one collective RPC that the engine core runs between steps. It has not been tested
+on GPUs.
+
+### Open items for a GPU run
+
+These conclusions come from reading the vLLM 0.29.0 and Dynamo 1.5.1 sources and
+have not run on hardware:
+
+- The pause of a prefill engine completes in about one step while it holds KV.
+- No "Potentially invalid KV blocks" line and no expired-KV count appears across a
+  refit.
+- A resumed decode engine heartbeats before the prefill engine expires a lease.
+- A refit contends with NIXL traffic for network bandwidth.
+- NeMo-Gym under the SingleController sends no request before the first refit.
 
 ## Dependencies
 
