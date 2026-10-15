@@ -255,6 +255,76 @@ def _patch_vllm_tool_parser_namespace_tool(logger) -> None:
     logger.info("Successfully patched vLLM NamespaceTool import for openai compat.")
 
 
+def _patch_vllm_pause_with_held_kv(logger) -> None:
+    """Let a keep-mode pause finish while a prefill engine still holds KV for decode.
+
+    A prefill/decode engine with a KV connector keeps the blocks of a finished
+    request until a decode engine pulls them. vLLM counts such a request in
+    ``Scheduler.has_finished_requests()``, so ``EngineCoreProc._pause_complete``
+    does not report a paused engine as idle until the pull finishes or the lease
+    ends. A paused decode engine schedules nothing and never pulls, so the pause
+    of the prefill engine waits for the whole lease.
+
+    A pause in ``PAUSED_ALL`` state schedules no request, so it does not need to
+    wait for this KV. With the patch, ``has_finished_requests()`` returns False
+    in that state for requests that the connector holds, and the pause completes
+    after the last batch. The held blocks stay allocated and are leased as
+    before. The engine goes idle, so it handles no notification and expires no
+    lease until it resumes.
+
+    The patch is only safe for a pause that does not clear the caches: clearing
+    needs to free the held blocks, and vLLM raises when it cannot. It does not
+    change ``PAUSED_NEW``, the state of a ``wait`` pause.
+    """
+    try:
+        file_to_patch = _get_vllm_file("v1/core/sched/scheduler.py")
+    except RuntimeError:
+        logger.warning("Could not locate scheduler.py for the held-KV pause patch.")
+        return
+
+    old_snippet = (
+        "    def has_finished_requests(self) -> bool:\n"
+        "        if self.finished_req_ids:\n"
+        "            return True\n"
+        "        if self.connector is None:\n"
+        "            return False\n"
+    )
+
+    new_snippet = (
+        "    def has_finished_requests(self) -> bool:\n"
+        "        if self.finished_req_ids:\n"
+        "            return True\n"
+        "        if self.connector is None:\n"
+        "            return False\n"
+        "        if self._pause_state == PauseState.PAUSED_ALL:\n"
+        "            # NeMo RL: a PAUSED_ALL scheduler does not wait for connector-held\n"
+        "            # KV. Nothing is scheduled, so a decode engine cannot pull it.\n"
+        "            return False\n"
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if (
+            "NeMo RL: a PAUSED_ALL scheduler does not wait for connector-held"
+            in content
+        ):
+            logger.info("vLLM held-KV pause patch already applied.")
+            return
+
+        if old_snippet not in content:
+            logger.warning(
+                "Could not apply the held-KV pause patch: expected "
+                "has_finished_requests() not found in %s. The vLLM version may "
+                "have changed, and a P/D pause can then wait for a KV lease.",
+                file_to_patch,
+            )
+            return
+
+        content = content.replace(old_snippet, new_snippet, 1)
+        write_back(content)
+
+    logger.info("Successfully patched vLLM to pause without waiting for held KV.")
+
+
 def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
     """Keep RayExecutorV2's TCPStore port out of the MessageQueue's scan range.
 
@@ -1023,6 +1093,7 @@ def ensure_vllm_source_compat() -> None:
     patch_logger = init_logger("vllm_patch")
     _patch_vllm_llama_eagle3_own_lm_head(patch_logger)
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
+    _patch_vllm_pause_with_held_kv(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
 

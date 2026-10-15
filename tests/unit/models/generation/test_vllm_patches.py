@@ -57,6 +57,9 @@ from tests.unit.models.generation.vllm_patch_source_utils import (
 _TOOL_PARSER_SOURCE = "tool_parsers/utils.py"
 _PATCH_FN = "_patch_vllm_tool_parser_namespace_tool"
 _MARKER = "except ImportError:  # openai < 2.25.0 predates namespace tools"
+_PAUSE_SOURCE = "v1/core/sched/scheduler.py"
+_PAUSE_PATCH_FN = "_patch_vllm_pause_with_held_kv"
+_PAUSE_MARKER = "NeMo RL: a PAUSED_ALL scheduler does not wait for connector-held"
 _RADIO_SOURCE = "model_executor/models/radio.py"
 _RADIO_PATCH_FN = "_patch_vllm_radio_layerscale_loader"
 _RADIO_MARKER = "initializer_factor = self.config.initializer_factor"
@@ -1008,3 +1011,136 @@ def test_init_workers_ray_reports_success_and_is_idempotent(monkeypatch, tmp_pat
 
     assert patches._patch_vllm_init_workers_ray("py-exec", None) is True
     assert ray_executor.read_text() == once
+
+
+@pytest.fixture
+def patched_scheduler_source(tmp_path, monkeypatch):
+    """The installed scheduler.py, unpatched then patched in tmp."""
+    copied = write_unpatched_copy(_PAUSE_SOURCE, _PAUSE_PATCH_FN, tmp_path / "sched.py")
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+    patches._patch_vllm_pause_with_held_kv(logging.getLogger(__name__))
+    return copied
+
+
+@pytest.mark.vllm
+def test_held_kv_pause_patch_anchor_still_matches_installed_vllm(
+    patched_scheduler_source,
+):
+    """A source edit becomes a silent no-op if upstream rewrites the method."""
+    content = patched_scheduler_source.read_text()
+    assert _PAUSE_MARKER in content, (
+        "the held-KV pause patch did not apply to the installed vLLM; "
+        "Scheduler.has_finished_requests() has probably changed upstream. A "
+        "prefill/decode in-flight pause then waits for a KV lease again."
+    )
+    ast.parse(content)  # the edit must leave valid Python
+
+
+@pytest.mark.vllm
+def test_held_kv_pause_patch_is_idempotent(patched_scheduler_source, monkeypatch):
+    """Every worker on a node runs the patch against the same file."""
+    before = patched_scheduler_source.read_text()
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(patched_scheduler_source)
+    )
+    patches._patch_vllm_pause_with_held_kv(logging.getLogger(__name__))
+    assert patched_scheduler_source.read_text() == before
+
+
+def _scheduler_with_has_finished_requests(tmp_path, monkeypatch, *, patch: bool):
+    """A stub Scheduler whose has_finished_requests() is the real vLLM method text."""
+    old_snippet, _ = patch_snippets(_PAUSE_PATCH_FN)
+    source = (
+        "import enum\n"
+        "\n"
+        "\n"
+        "class PauseState(enum.IntEnum):\n"
+        "    UNPAUSED = 0\n"
+        "    PAUSED_NEW = 1\n"
+        "    PAUSED_ALL = 2\n"
+        "\n"
+        "\n"
+        "class Scheduler:\n"
+        "    def __init__(self, state, finished_req_ids, connector, requests, queued):\n"
+        "        self._pause_state = state\n"
+        "        self.finished_req_ids = finished_req_ids\n"
+        "        self.connector = connector\n"
+        "        self.requests = requests\n"
+        "        self.waiting = list(range(queued))\n"
+        "        self.skipped_waiting = []\n"
+        "        self.running = []\n"
+        "\n"
+        f"{old_snippet}"
+        "        num_in_queues = (\n"
+        "            len(self.waiting) + len(self.skipped_waiting) + len(self.running)\n"
+        "        )\n"
+        "        return len(self.requests) > num_in_queues\n"
+    )
+    file = tmp_path / "scheduler_stub.py"
+    file.write_text(source)
+    if patch:
+        monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(file))
+        patches._patch_vllm_pause_with_held_kv(logging.getLogger(__name__))
+        assert _PAUSE_MARKER in file.read_text()
+    namespace: dict = {}
+    exec(compile(file.read_text(), str(file), "exec"), namespace)
+    return namespace["Scheduler"], namespace["PauseState"]
+
+
+@pytest.mark.parametrize(
+    ("state", "finished_req_ids", "connector", "held", "expected"),
+    [
+        # Requests a connector holds after they finish count as work, unless the
+        # scheduler is in PAUSED_ALL.
+        ("UNPAUSED", set(), object(), True, True),
+        ("PAUSED_NEW", set(), object(), True, True),
+        ("PAUSED_ALL", set(), object(), True, False),
+        # A request that just finished still needs one step to reach the worker.
+        ("PAUSED_ALL", {"req"}, object(), True, True),
+        # Without a connector nothing is held, whatever the state.
+        ("PAUSED_ALL", set(), None, True, False),
+        ("UNPAUSED", set(), object(), False, False),
+    ],
+)
+def test_held_kv_pause_patch_changes_only_the_paused_all_state(
+    tmp_path, monkeypatch, state, finished_req_ids, connector, held, expected
+):
+    scheduler_cls, pause_state = _scheduler_with_has_finished_requests(
+        tmp_path, monkeypatch, patch=True
+    )
+    # "held" means a finished request is still in self.requests but in no queue.
+    scheduler = scheduler_cls(
+        pause_state[state],
+        finished_req_ids,
+        connector,
+        requests={"held-request"} if held else set(),
+        queued=0,
+    )
+
+    assert scheduler.has_finished_requests() is expected
+
+
+def test_held_kv_pause_patch_is_needed_without_it(tmp_path, monkeypatch):
+    """Negative control: unpatched vLLM waits on held KV even when PAUSED_ALL."""
+    scheduler_cls, pause_state = _scheduler_with_has_finished_requests(
+        tmp_path, monkeypatch, patch=False
+    )
+    scheduler = scheduler_cls(
+        pause_state.PAUSED_ALL, set(), object(), requests={"held-request"}, queued=0
+    )
+
+    assert scheduler.has_finished_requests() is True
+
+
+def test_held_kv_pause_patch_warns_on_unknown_source(monkeypatch, tmp_path, caplog):
+    scheduler_source = tmp_path / "scheduler.py"
+    scheduler_source.write_text("class Scheduler:\n    pass\n")
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(scheduler_source)
+    )
+
+    with caplog.at_level(logging.WARNING):
+        patches._patch_vllm_pause_with_held_kv(logging.getLogger(__name__))
+
+    assert scheduler_source.read_text() == "class Scheduler:\n    pass\n"
+    assert "has_finished_requests() not found" in caplog.text
