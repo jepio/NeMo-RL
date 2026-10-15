@@ -84,7 +84,6 @@ def _dynamo_cfg() -> dict:
             "tokenizer_cache": False,
             "tokenizer_cache_bytes": 50 * 1024 * 1024,
             "router_mode": "kv",
-            "router_reset_states": True,
             "extra_cli_args": [],
         },
     }
@@ -294,12 +293,25 @@ def test_config_accepts_inherited_unused_sections() -> None:
     assert validated.model_extra["refit_cfg"] == {"some_shared_setting": True}
 
 
+@pytest.mark.parametrize("value", [True, False])
+def test_frontend_rejects_removed_router_reset_states(value) -> None:
+    dynamo_cfg = _dynamo_cfg()
+    dynamo_cfg["frontend_args"]["router_reset_states"] = value
+    with pytest.raises(
+        ValueError,
+        match=r"frontend_args\.router_reset_states was removed.*--router-reset-states",
+    ):
+        DynamoCfg.model_validate(dynamo_cfg)
+
+
 def test_frontend_argv_and_environment_are_runtime_owned() -> None:
     cfg = DynamoCfg.model_validate(_dynamo_cfg())
     argv = build_dynamo_frontend_argv(
         host="0.0.0.0", port=3001, namespace="nemo-rl", dynamo_cfg=cfg
     )
     assert _flag_value(argv, "--router-mode") == "kv"
+    assert not any(arg.startswith("--router-reset-states") for arg in argv)
+    assert not any(arg.startswith("--no-router-reset-states") for arg in argv)
 
     env = build_managed_worker_env(
         base_env={
