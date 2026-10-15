@@ -381,6 +381,11 @@ Current limits on this path:
   worker extension in each engine enforces it.
 - `async_rl.recompute_kv_cache_after_weight_updates` must be false: the
   pre-refit drain already clears every worker's cache.
+- `dynamo_cfg.disaggregation` must be null. The drain pauses in `wait` mode and
+  then clears the caches, and that clear raises when a decode engine still has a
+  request that waits for remote KV. Pausing prefill first narrows this window but
+  does not close it, and this combination is not qualified. Use the legacy async
+  loop for prefill/decode fleets.
 - `dynamo_cfg.control_timeout_s` must be at least `dynamo_cfg.request_timeout_s`,
   because it bounds the drain.
 - `vllm_cfg.enable_vllm_metrics_logger` must be false; only the legacy GRPO loop

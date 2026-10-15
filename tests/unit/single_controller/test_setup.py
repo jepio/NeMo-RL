@@ -162,6 +162,7 @@ def _make_master_config(
         generation_config["dynamo_cfg"] = {
             "request_timeout_s": 900.0,
             "control_timeout_s": 900.0,
+            "disaggregation": None,
         }
         generation_config["vllm_cfg"] = {"enable_vllm_metrics_logger": False}
     master_config = MasterConfig.model_construct(
@@ -397,6 +398,26 @@ def test_dynamo_accepts_refit_deadline():
     """The worker extension inside each Dynamo engine enforces the refit deadline."""
     master_config = _make_master_config(backend="dynamo")
     master_config.async_rl.generation_fleet_health.refit_timeout_s = 300.0
+
+    sc_setup_mod.DynamoGeneration.validate_settings(master_config)
+
+
+def test_dynamo_rejects_disaggregation_under_the_single_controller():
+    """The wait-mode drain can fail on decode requests that wait for remote KV."""
+    master_config = _make_master_config(backend="dynamo")
+    master_config.policy["generation"]["dynamo_cfg"]["disaggregation"] = {
+        "prefill_workers": 1,
+        "decode_workers": 1,
+        "kv_lease_duration_s": 120,
+    }
+
+    with pytest.raises(ValueError, match="disaggregation is not supported"):
+        sc_setup_mod.DynamoGeneration.validate_settings(master_config)
+
+
+def test_dynamo_accepts_aggregated_fleet_under_the_single_controller():
+    master_config = _make_master_config(backend="dynamo")
+    assert master_config.policy["generation"]["dynamo_cfg"]["disaggregation"] is None
 
     sc_setup_mod.DynamoGeneration.validate_settings(master_config)
 

@@ -176,6 +176,19 @@ class DynamoGeneration(GenerationInterface):
         # Setup has already normalized this through DynamoConfig.
         generation = cast(dict[str, Any], master_config.policy["generation"])
         dynamo_cfg = generation["dynamo_cfg"]
+        if dynamo_cfg["disaggregation"] is not None:
+            # The drain pauses in "wait" mode and then clears the caches. A decode
+            # engine that still has a request waiting on remote KV, or one whose
+            # KV read finished but which is not promoted yet, makes that clear
+            # raise. Prefill-first ordering narrows this window and does not close
+            # it, and nothing qualifies a P/D fleet under this trainer.
+            raise ValueError(
+                "policy.generation.dynamo_cfg.disaggregation is not supported with "
+                "the SingleController; its pre-refit drain can fail on decode "
+                "requests that wait for remote KV. Set "
+                "policy.generation.dynamo_cfg.disaggregation=null, or use the "
+                "legacy async GRPO loop (examples/run_grpo.py)."
+            )
         if dynamo_cfg["control_timeout_s"] < dynamo_cfg["request_timeout_s"]:
             raise ValueError(
                 "policy.generation.dynamo_cfg.control_timeout_s "
