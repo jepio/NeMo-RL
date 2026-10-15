@@ -15,6 +15,7 @@
 
 import asyncio
 import logging
+import math
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -51,6 +52,9 @@ if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 
 LOGGER = logging.getLogger(__name__)
+
+# Margin for the pause and resume calls around one refit, on top of its deadline.
+_REFIT_PAUSE_MARGIN_S = 60
 
 _HTTP_MAX_ATTEMPTS = 3
 _HTTP_RETRY_DELAY_S = 1.0
@@ -166,36 +170,47 @@ class DynamoGeneration(GenerationInterface):
                 "routing. Set async_rl.generation_fleet_health.enabled=false."
             )
         if master_config.async_rl.recompute_kv_cache_after_weight_updates:
-            # The pre-refit drain already clears every worker's cache, and nothing
-            # runs until resume, so a post-refit flush only adds a second drain.
+            # The pause that surrounds a refit never clears the caches: a
+            # prefill/decode fleet cannot clear them while it pauses.
             raise ValueError(
                 "async_rl.recompute_kv_cache_after_weight_updates must be false with "
-                "policy.generation.backend='dynamo'; the pre-refit drain already "
-                "clears every worker's KV and prefix cache."
+                "policy.generation.backend='dynamo'; the refit pause does not clear "
+                "the KV or prefix cache."
             )
         # Setup has already normalized this through DynamoConfig.
         generation = cast(dict[str, Any], master_config.policy["generation"])
         dynamo_cfg = generation["dynamo_cfg"]
-        if dynamo_cfg["disaggregation"] is not None:
-            # The drain pauses in "wait" mode and then clears the caches. A decode
-            # engine that still has a request waiting on remote KV, or one whose
-            # KV read finished but which is not promoted yet, makes that clear
-            # raise. Prefill-first ordering narrows this window and does not close
-            # it, and nothing qualifies a P/D fleet under this trainer.
+        refit_timeout_s = fleet_health.refit_timeout_s
+        if refit_timeout_s is not None and (
+            dynamo_cfg["request_timeout_s"] <= refit_timeout_s
+        ):
+            # A request is frozen, not finished, while the engines pause for a
+            # refit, and its HTTP call keeps waiting.
             raise ValueError(
-                "policy.generation.dynamo_cfg.disaggregation is not supported with "
-                "the SingleController; its pre-refit drain can fail on decode "
-                "requests that wait for remote KV. Set "
-                "policy.generation.dynamo_cfg.disaggregation=null, or use the "
-                "legacy async GRPO loop (examples/run_grpo.py)."
+                "policy.generation.dynamo_cfg.request_timeout_s "
+                f"({dynamo_cfg['request_timeout_s']}) must be greater than "
+                f"async_rl.generation_fleet_health.refit_timeout_s ({refit_timeout_s}): "
+                "requests stay open while the engines pause for a refit."
             )
-        if dynamo_cfg["control_timeout_s"] < dynamo_cfg["request_timeout_s"]:
-            raise ValueError(
-                "policy.generation.dynamo_cfg.control_timeout_s "
-                f"({dynamo_cfg['control_timeout_s']}) must be >= request_timeout_s "
-                f"({dynamo_cfg['request_timeout_s']}): it bounds the pre-refit drain, "
-                "which waits for running requests to finish."
-            )
+        disaggregation = dynamo_cfg["disaggregation"]
+        if disaggregation is not None:
+            if refit_timeout_s is None:
+                raise ValueError(
+                    "async_rl.generation_fleet_health.refit_timeout_s must be set "
+                    "with policy.generation.dynamo_cfg.disaggregation: without a "
+                    "refit deadline the engines can stay paused longer than the "
+                    "KV lease, and a decode engine can then read wrong KV."
+                )
+            # One refit and one retry, each with the pause and resume margin.
+            needed_lease_s = math.ceil(2 * (refit_timeout_s + _REFIT_PAUSE_MARGIN_S))
+            if disaggregation["kv_lease_duration_s"] < needed_lease_s:
+                raise ValueError(
+                    "policy.generation.dynamo_cfg.disaggregation.kv_lease_duration_s "
+                    f"({disaggregation['kv_lease_duration_s']}) must be at least "
+                    f"{needed_lease_s} s: twice (refit_timeout_s={refit_timeout_s} "
+                    f"+ {_REFIT_PAUSE_MARGIN_S} s), because the SingleController "
+                    "retries a failed refit once while the engines stay paused."
+                )
         if generation["vllm_cfg"]["enable_vllm_metrics_logger"]:
             # Only the legacy GRPO loop reads and clears the driver's sampler; here
             # it would accumulate samples for the whole run.
@@ -351,8 +366,16 @@ class DynamoGeneration(GenerationInterface):
         return self._dynamo_frontend_base_url
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
-        """Invalidate cached rollout state after synchronous generation."""
-        return self.invalidate_kv_cache()
+        """Reset the prefix caches after a phase of generation, without a pause.
+
+        The async trainers call this after validation while rollouts can still be
+        in flight, so it must not drain or pause the engines. A drain would hold
+        every rollout, and on a prefill/decode fleet a ``wait`` pause stalls and the
+        cache clear can raise. The reset keeps blocks that a running request or a
+        held KV lease still uses.
+        """
+        self._require_refit_channel().reset_prefix_cache()
+        return True
 
     def get_logger_metrics(self) -> dict[str, Any]:
         """Return per-worker Dynamo metric timelines for generation logging."""
@@ -843,12 +866,20 @@ class DynamoGeneration(GenerationInterface):
         return channel.flush_cache()
 
     def drain_for_weight_update(self) -> None:
-        """Drain and pause every worker; layerwise reload is unsafe mid-request."""
-        self._require_refit_channel().pause(mode="wait", clear_cache=True)
+        """Freeze every engine before a SingleController weight update.
+
+        Layerwise reload is unsafe beside a running request, so the engines pause.
+        They use the keep mode, as for the async GRPO loop: running requests are
+        frozen and continue on the new weights after
+        :meth:`resume_after_weight_update`. Caches are not cleared. This is
+        :meth:`pause_generation_for_refit` without the cache clear, which a
+        prefill/decode fleet cannot do.
+        """
+        self.pause_generation_for_refit(clear_cache=False)
 
     def resume_after_weight_update(self) -> None:
-        """Resume every worker after a weight update."""
-        self._require_refit_channel().resume()
+        """Resume every engine after a SingleController weight update."""
+        self.resume_generation_after_refit()
 
     def pause_generation_for_refit(self, *, clear_cache: bool) -> bool:
         """Freeze every engine's in-flight requests for an in-flight weight update.

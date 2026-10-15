@@ -539,6 +539,40 @@ class DynamoRefitChannel:
                 + "; ".join(resume_errors)
             )
 
+    def reset_prefix_cache(self) -> None:
+        """Ask every engine to reset its prefix cache, without a pause or a drain.
+
+        Dynamo's ``flush_cache`` route resets the cache and does not touch running
+        requests. vLLM then keeps any block that a running request or a held KV
+        lease still uses, so the reset can be partial. The route reports success
+        either way, so only a failed call raises an error.
+
+        Raises:
+            RuntimeError: If a call to any engine fails.
+        """
+        futures = [
+            (
+                worker,
+                _post_worker_route.remote(
+                    system_url=worker.system_url,
+                    route="flush_cache",
+                    payload={},
+                    timeout_s=self._control_timeout_s,
+                ),
+            )
+            for worker in self._workers
+        ]
+        errors: list[str] = []
+        for worker, future in futures:
+            try:
+                ray.get(future)
+            except Exception as error:
+                errors.append(f"{worker.system_url}: {error}")
+        if errors:
+            raise RuntimeError(
+                "Dynamo prefix cache reset failed for " + "; ".join(errors)
+            )
+
     def flush_cache(self) -> bool:
         """Drain, clear, and resume every worker using immutable endpoints.
 

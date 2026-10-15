@@ -402,16 +402,52 @@ def test_dynamo_accepts_refit_deadline():
     sc_setup_mod.DynamoGeneration.validate_settings(master_config)
 
 
-def test_dynamo_rejects_disaggregation_under_the_single_controller():
-    """The wait-mode drain can fail on decode requests that wait for remote KV."""
+def _disaggregated_dynamo_sc_config(*, lease_s: int = 1800):
     master_config = _make_master_config(backend="dynamo")
     master_config.policy["generation"]["dynamo_cfg"]["disaggregation"] = {
         "prefill_workers": 1,
         "decode_workers": 1,
-        "kv_lease_duration_s": 120,
+        "kv_lease_duration_s": lease_s,
     }
+    return master_config
 
-    with pytest.raises(ValueError, match="disaggregation is not supported"):
+
+def test_dynamo_accepts_disaggregation_with_a_refit_deadline_and_a_long_lease():
+    """The keep-mode drain works on a P/D fleet: nothing waits on remote KV."""
+    master_config = _disaggregated_dynamo_sc_config()
+    refit_timeout_s = master_config.async_rl.generation_fleet_health.refit_timeout_s
+    assert refit_timeout_s is not None
+
+    sc_setup_mod.DynamoGeneration.validate_settings(master_config)
+
+
+def test_dynamo_disaggregation_needs_a_refit_deadline():
+    master_config = _disaggregated_dynamo_sc_config()
+    master_config.async_rl.generation_fleet_health.refit_timeout_s = None
+
+    with pytest.raises(ValueError, match="refit_timeout_s must be set"):
+        sc_setup_mod.DynamoGeneration.validate_settings(master_config)
+
+
+def test_dynamo_disaggregation_lease_must_cover_a_refit_and_its_retry():
+    master_config = _disaggregated_dynamo_sc_config(lease_s=719)
+    master_config.async_rl.generation_fleet_health.refit_timeout_s = 300.0
+
+    # 2 * (300 + 60) = 720 s: one refit and one retry while the engines stay paused.
+    with pytest.raises(ValueError, match="at least 720 s"):
+        sc_setup_mod.DynamoGeneration.validate_settings(master_config)
+
+    master_config = _disaggregated_dynamo_sc_config(lease_s=720)
+    master_config.async_rl.generation_fleet_health.refit_timeout_s = 300.0
+    sc_setup_mod.DynamoGeneration.validate_settings(master_config)
+
+
+def test_dynamo_request_timeout_must_outlast_the_refit_pause():
+    master_config = _make_master_config(backend="dynamo")
+    master_config.async_rl.generation_fleet_health.refit_timeout_s = 300.0
+    master_config.policy["generation"]["dynamo_cfg"]["request_timeout_s"] = 300.0
+
+    with pytest.raises(ValueError, match="must be greater than"):
         sc_setup_mod.DynamoGeneration.validate_settings(master_config)
 
 
@@ -1541,14 +1577,14 @@ class TestSetup:
                     mc.async_rl, "recompute_kv_cache_after_weight_updates", True
                 ),
                 "recompute_kv_cache_after_weight_updates must be false",
-                id="second_drain",
+                id="refit_pause_does_not_clear_caches",
             ),
             pytest.param(
                 lambda mc: mc.policy["generation"]["dynamo_cfg"].update(
-                    control_timeout_s=600.0
+                    request_timeout_s=300.0
                 ),
-                "must be >= request_timeout_s",
-                id="drain_timeout",
+                "must be greater than",
+                id="request_timeout_vs_refit_pause",
             ),
             pytest.param(
                 lambda mc: mc.policy["generation"]["vllm_cfg"].update(

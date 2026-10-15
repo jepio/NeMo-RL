@@ -687,14 +687,12 @@ class GenerationInterface(ABC):
         return False
 
     def drain_for_weight_update(self) -> None:
-        """Finish running requests and hold the rest before a weight update.
+        """Make the engine safe for a weight update that the SingleController starts.
 
-        Unlike :meth:`pause_generation_for_refit`, which freezes in-flight requests
-        so they continue on the new weights, this lets requests the engine is
-        running complete on the current weights; queued and new requests wait and
-        run on the new weights. Backends whose weight update is unsafe while any
-        request runs override it (managed Dynamo's layerwise reload). The default
-        is a no-op, for engines that take weight updates with requests in flight.
+        The default is a no-op, for engines that take weight updates while they
+        serve. A backend whose weight update is unsafe while a request runs
+        overrides it. Managed Dynamo freezes its in-flight requests, so they
+        continue on the new weights, as :meth:`pause_generation_for_refit` does.
         """
 
     def resume_after_weight_update(self) -> None:

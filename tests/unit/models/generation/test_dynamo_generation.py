@@ -239,13 +239,46 @@ def test_prompt_at_context_limit_is_rejected(monkeypatch) -> None:
         generation._allowed_new_tokens(5)
 
 
-def test_finish_generation_invalidates_sync_rollout_cache(monkeypatch) -> None:
-    _patch_runtime(monkeypatch)
+def test_finish_generation_resets_prefix_caches_without_pausing(monkeypatch) -> None:
+    workers = [
+        {"instance_id": "a", "system_url": "http://a:4000", "role": "decode"},
+        {"instance_id": "b", "system_url": "http://b:4000", "role": "prefill"},
+    ]
+    _patch_runtime(monkeypatch, workers=workers)
+    calls = []
+    monkeypatch.setattr(
+        refit_module._post_worker_route,
+        "remote",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+    monkeypatch.setattr(refit_module.ray, "get", lambda refs: refs)
     generation = DynamoGeneration(cluster=object(), config=_config())
-    generation.invalidate_kv_cache = MagicMock(return_value=True)
 
     assert generation.finish_generation()
-    generation.invalidate_kv_cache.assert_called_once_with()
+
+    # The async trainers call this after validation, with rollouts still in flight.
+    # It must not pause or drain, which holds the rollouts and, on a prefill/decode
+    # fleet, stalls and can raise.
+    assert [(call["route"], call["payload"]) for call in calls] == [
+        ("flush_cache", {}),
+        ("flush_cache", {}),
+    ]
+
+
+def test_finish_generation_reports_a_failed_cache_reset(monkeypatch) -> None:
+    _patch_runtime(monkeypatch)
+    monkeypatch.setattr(
+        refit_module._post_worker_route, "remote", lambda **kwargs: "token"
+    )
+
+    def get(ref):
+        raise RuntimeError("refused")
+
+    monkeypatch.setattr(refit_module.ray, "get", get)
+    generation = DynamoGeneration(cluster=object(), config=_config())
+
+    with pytest.raises(RuntimeError, match="prefix cache reset failed"):
+        generation.finish_generation()
 
 
 def test_merged_stop_strings_enforce_dynamo_limit(monkeypatch) -> None:
@@ -446,7 +479,7 @@ def test_cache_invalidation_resumes_every_worker_after_a_peer_failure(
     ]
 
 
-def test_drain_for_weight_update_pauses_every_worker_and_resume_restores_them(
+def test_drain_for_weight_update_freezes_every_worker_and_resume_restores_them(
     monkeypatch,
 ) -> None:
     workers = [
@@ -475,9 +508,11 @@ def test_drain_for_weight_update_pauses_every_worker_and_resume_restores_them(
         pickle.dumps(DynamoGeneration(cluster=object(), config=_config()))
     )
     generation.drain_for_weight_update()
+    # The SingleController freezes the requests, as the async loop does, and does
+    # not clear the caches: a prefill/decode fleet cannot clear them while it pauses.
     assert [(call["route"], call["payload"]) for call in calls] == [
-        ("pause_generation", {"mode": "wait", "clear_cache": True}),
-        ("pause_generation", {"mode": "wait", "clear_cache": True}),
+        ("pause_generation", {"mode": "keep", "clear_cache": False}),
+        ("pause_generation", {"mode": "keep", "clear_cache": False}),
     ]
 
     calls.clear()
