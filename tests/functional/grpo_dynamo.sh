@@ -32,7 +32,7 @@ git config --global --add safe.directory "${PROJECT_ROOT}"
 dynamo_python=$(uv run --no-sync python -c \
   'from nemo_rl.models.generation.dynamo.venv import get_dynamo_python; print(get_dynamo_python())' | tail -n 1)
 "${dynamo_python}" -c \
-  'import importlib.metadata as m; assert m.version("ai-dynamo") == "1.5.1"; assert m.version("vllm") == "0.29.0"'
+  'import importlib.metadata as m; assert m.version("ai-dynamo") == "1.5.1"; assert m.version("vllm") == "0.29.0"; assert m.version("nixl") == "1.3.0"; assert m.version("nixl-cu13") == "1.3.0"'
 uv run --no-sync python -c \
   'from nemo_rl.models.generation.dynamo.venv import get_dynamo_service_executable as e; e("etcd"); e("nats-server")'
 
