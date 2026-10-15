@@ -2,7 +2,8 @@
 
 NeMo RL can launch and own Dynamo's control plane, frontend, and a fixed vLLM
 worker fleet inside a Slurm-backed Ray allocation. This mode supports direct
-GRPO and NeMo-Gym rollouts, NCCL and `nccl_reshard` weight refits, cache invalidation, and
+GRPO and NeMo-Gym rollouts, NCCL and `nccl_reshard` weight refits, in-flight
+weight updates, optional prefill/decode disaggregation, cache invalidation, and
 `generation_metrics/*` telemetry sent to enabled loggers such as W&B.
 See the [Dynamo integration design](../design-docs/dynamo-integration.md) for
 the service ownership, startup, and weight-refit architecture.
@@ -37,6 +38,11 @@ vLLM workers. That is what lets each engine load NeMo RL's vLLM worker
 extension for refit (see [Weight refit](#weight-refit)). Only the base
 `ai-dynamo` package is installed: its `[vllm]` extra pins vLLM 0.28.0.
 
+`ai-dynamo` also requires `aisimulate`, which pulls in JAX, flax and optax, and
+`kubernetes`. Only Dynamo's planner, profiler and replay tooling import them, not
+the `dynamo.vllm` and `dynamo.frontend` processes that NeMo RL starts, so
+`override-dependencies` in the root `pyproject.toml` keeps both out of the lock.
+
 From a source checkout, the venv is built on first use under
 `venvs/nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker`, like
 every other actor venv. etcd and nats-server are looked up in
@@ -48,12 +54,26 @@ A Dynamo upgrade must update and reverify these coupled locations:
 
 - root `pyproject.toml` and `uv.lock`: the `ai-dynamo` and
   `ai-dynamo-runtime` pins in the `dynamo` extra, which must otherwise stay
-  identical to the `vllm` extra (`tests/unit/test_dependency_pins.py`)
-- `tests/functional/grpo_dynamo*.sh`: the asserted Dynamo and vLLM versions
+  identical to the `vllm` extra (`tests/unit/test_dependency_pins.py`), and the
+  `aisimulate` and `kubernetes` overrides. Search the new wheel for imports of
+  either package outside the planner, profiler, replay and mocker tooling before
+  you keep the overrides
+- `tests/functional/grpo_dynamo*.sh` and
+  `tests/test_suites/llm/grpo-qwen3-0.6b-1n8g-dtensor2tp1-dynamo-disagg.sh`: the
+  asserted Dynamo, vLLM and NIXL versions. The P/D nightly also greps vLLM's
+  decode-side `NIXL compatibility check passed` log line; reverify it against the
+  new vLLM release
+- `nemo_rl/models/generation/dynamo/arguments.py`: the P/D flags
+  (`--disaggregation-mode`, `--kv-transfer-config`, `--kv-events-config`), the
+  `backend` and `prefill` component names the frontend wait in
+  `managed_runtime.py` counts, and vLLM's `kv_load_failure_policy` and
+  `kv_lease_duration` settings
 - `nemo_rl/models/generation/dynamo/refit.py`: the `/engine/*` RL routes it
   posts to, which must still forward any `engine_rpc` to vLLM `collective_rpc`
   with the request body as keyword arguments
-  (`test_every_engine_rpc_the_driver_sends_binds_to_the_extension`)
+  (`test_every_engine_rpc_the_driver_sends_binds_to_the_extension`), and the
+  `pause_generation` route, which must still accept `mode` (`wait` or `keep`) and
+  `clear_cache` and pass them to vLLM's `pause_generation`
 - `nemo_rl/models/generation/dynamo/token_wrapper.py`: the real Dynamo response
   keys `nvext.engine_data.{prompt_token_ids,completion_token_ids,completion_logprobs}`;
   reverify them against real Dynamo output because unit tests validate only the
@@ -75,6 +95,7 @@ policy:
     backend: dynamo
     dynamo_cfg:
       engine: vllm
+      disaggregation: null
       frontend_args:
         router_mode: kv
     vllm_cfg:
@@ -129,6 +150,95 @@ policy:
       metrics_exclude_prefixes: null  # null excludes python_ and process_
 ```
 
+### Prefill/decode disaggregation
+
+Use
+[`examples/configs/grpo_math_1B_dynamo_disagg.yaml`](../../examples/configs/grpo_math_1B_dynamo_disagg.yaml)
+for a small prefill/decode example. The opt-in fields are:
+
+```yaml
+policy:
+  generation:
+    dynamo_cfg:
+      disaggregation:
+        prefill_workers: 1
+        decode_workers: 1
+        kv_lease_duration_s: 600
+```
+
+Both roles use the same `vllm_cfg` and `vllm_kwargs`. The required inference
+GPU count is:
+
+```text
+(prefill_workers + decode_workers) * tensor_parallel_size * pipeline_parallel_size
+```
+
+Each TP times PP engine must fit on one node. Prefill and decode engines may be
+on different nodes. NeMo RL starts decode engines first and then prefill
+engines. This gives every engine a stable NCCL refit rank.
+
+NeMo RL manages `--disaggregation-mode`, the NIXL connector, NIXL side-channel
+ports, and prefill KV-event ports. Do not set these values in
+`worker_args.extra_cli_args`, `vllm_kwargs`, or `vllm_cfg.env_vars`.
+When vLLM prefix caching is disabled, Dynamo does not publish KV events because
+there are no cached prefixes to reuse. Decode workers never publish KV events,
+so `router_mode: kv` applies KV-aware routing only when selecting a prefill
+worker.
+
+NIXL moves KV-cache data from prefill to decode. NCCL moves model weights from
+training to every prefill and decode engine, and both roles are paused and
+resumed around each refit. `NCCL_*` variables tune only the refit transport.
+NIXL uses UCX by default, so set UCX variables such as `UCX_TLS` and
+`UCX_NET_DEVICES` in `vllm_cfg.env_vars` to tune cross-node KV transfer. Same-node
+transfer can use CUDA transport; cross-node transfer requires a working NIXL
+UCX/RDMA path and is not qualified when it falls back to TCP.
+
+Two managed vLLM settings keep disaggregation robust across refits:
+
+- `kv_load_failure_policy: recompute`: when a decode engine cannot pull KV from
+  prefill, it prefills locally instead of failing the rollout.
+- `kv_lease_duration_s`: how long a prefill engine holds a finished request's KV
+  for the decode engine. Decode engines renew it only while they step, and an
+  [in-flight weight update](#in-flight-weight-updates) freezes them for the whole
+  refit. Keep the lease longer than your longest refit; a lapsed lease costs a
+  local recompute, not a failure.
+
+## In-flight weight updates
+
+`grpo.async_grpo.in_flight_weight_updates: true` refits without waiting for the
+longest active rollout. Before each refit the async collector pauses every
+Dynamo engine in vLLM's `keep` mode: the engines stop stepping, so layerwise
+weight reload never runs beside a request, and they keep their running requests.
+After the NCCL refit the engines resume, and the kept requests continue
+generating on the new weights. New requests queue while paused. This is the
+same contract as the native async vLLM backend, so a trajectory can span
+weight versions, which is what `max_trajectory_age_steps > 1` relies on.
+
+With `in_flight_weight_updates: false` the collector instead waits for every
+active trajectory to finish before the refit, as before.
+
+`grpo.async_grpo.recompute_kv_cache_after_weight_updates` controls the cache:
+
+- `true`: each engine clears its KV and prefix caches while paused, so kept
+  requests recompute their KV on the new weights.
+- `false`: kept requests continue with the KV they computed on the old weights.
+
+Setup rejects the one combination vLLM cannot do: in-flight updates with
+`recompute_kv_cache_after_weight_updates: true` on a disaggregated fleet. Clearing
+the cache preempts running requests, which vLLM cannot do for a decode request
+that is waiting on remote KV from a prefill engine. Use `false` there, as the
+disaggregated example does.
+
+Operational notes:
+
+- Requests stay open while the fleet is paused, so `dynamo_cfg.request_timeout_s`
+  must exceed the longest refit.
+- `dynamo_cfg.control_timeout_s` bounds each pause and resume call.
+- A pause that fails on any engine resumes the engines that did pause and
+  raises, so a failed refit never leaves the fleet frozen.
+- The SingleController does not use keep-mode pause; it still drains (see
+  [Run under the SingleController](#run-under-the-singlecontroller)).
+
 ## FP8 generation
 
 `vllm_cfg.precision: fp8` (optionally with `is_mx`, mixed BF16 layers, DeepGEMM
@@ -175,6 +285,8 @@ The fixed port layout is:
 - `1313-1399`: driver-local etcd and NATS control plane
 - `3000-3999`: frontend and token-wrapper HTTP endpoints
 - `4000-4099`: node-local `DYN_SYSTEM_PORT`
+- `4100-4199`: node-local NIXL side-channel ports
+- `4200-4299`: node-local prefill KV-event ports
 - `7000 + slot * 100`: node-local vLLM rendezvous ports
 
 ## Run the two-GPU smoke
@@ -206,6 +318,38 @@ steps exercise generation, refit, post-refit cache invalidation, telemetry,
 and cleanup. For a matched control, run the same seed/model/batch settings with
 the standard non-colocated vLLM backend and compare post-refit output validity.
 
+To exercise in-flight updates on the same two GPUs, add
+`grpo.async_grpo.in_flight_weight_updates=true` to the command; the Dynamo L1
+job runs this as `tests/functional/grpo_dynamo_in_flight.sh`.
+
+## Run the three-GPU disaggregated smoke
+
+Use the same command with three GPUs and the P/D config:
+
+```bash
+export GPUS_PER_NODE=3
+printf -v COMMAND '%q ' \
+  /opt/nemo_rl_venv/bin/python -u "$PWD/examples/run_grpo.py" \
+  --config "$PWD/examples/configs/grpo_math_1B_dynamo_disagg.yaml"
+export COMMAND
+
+sbatch \
+  --nodes=1 \
+  --gres=gpu:3 \
+  --exclusive \
+  --account=<account> \
+  --partition=<partition> \
+  ray.sub
+```
+
+This assigns one GPU to training, one to a TP1 decode engine, and one to a TP1
+prefill engine, and refits in flight without clearing caches. The Dynamo L1 job
+runs the two-GPU aggregated smokes. The P/D smoke runs in the H100 nightly suite
+through
+`tests/test_suites/llm/grpo-qwen3-0.6b-1n8g-dtensor2tp1-dynamo-disagg.sh`, which
+allocates one eight-GPU node and leaves five GPUs unused. Both smokes verify
+function only and make no performance claim.
+
 ## Run under the SingleController
 
 The async SingleController trainer can also use managed Dynamo. It follows the
@@ -220,7 +364,10 @@ and launch it with `examples/run_grpo_single_controller.py`. Before every weight
 update the SingleController drains and pauses each Dynamo worker (requests the
 engine is running finish on the old weights; queued and new requests wait and
 run on the new weights), runs the NCCL refit, and then resumes the workers. The
-drain is bounded by `dynamo_cfg.control_timeout_s`.
+drain is bounded by `dynamo_cfg.control_timeout_s`. Unlike the legacy async
+loop's [in-flight weight updates](#in-flight-weight-updates), the
+SingleController does not freeze and keep running requests; moving it to
+keep-mode pause is follow-up work.
 
 Current limits on this path:
 

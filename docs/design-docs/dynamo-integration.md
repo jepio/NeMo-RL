@@ -13,8 +13,31 @@ worker group must fit on one node. Its world size is derived from vLLM tensor
 parallelism times pipeline parallelism; expert parallelism must be either one
 or equal to tensor parallelism.
 
+Aggregated mode creates one homogeneous backend fleet from all inference GPU
+groups. Disaggregated mode creates fixed decode and prefill pools. The pools
+have independent replica counts but share TP, PP, EP, and all other vLLM
+settings. Decode engines are ordered before prefill engines. This order is the
+fixed engine order for placement, membership checks, metrics, and refit ranks.
+
+Every P/D engine uses vLLM's `NixlConnector` with `kv_role: kv_both`, which
+Dynamo requires for prefill workers. NeMo RL owns each engine's NIXL host and
+side-channel port; vLLM serves every TP rank's handshake of an engine from the
+one listener, so one port per engine suffices. Prefill engines also receive
+managed KV-event configuration for the router. Dynamo disables these events when
+vLLM prefix caching is disabled because there are no cached prefixes to reuse.
+Same-node transfer can use CUDA transport. Cross-node transfer requires a working
+NIXL UCX/RDMA path and is not qualified when it falls back to TCP.
+
+The connector also sets two vLLM options that matter across weight updates.
+`kv_load_failure_policy: recompute` turns a failed KV pull into a local prefill.
+`kv_lease_duration` (`dynamo_cfg.disaggregation.kv_lease_duration_s`) is how long
+a prefill engine keeps a finished request's KV for the decode engine. Leases are
+renewed by the decode scheduler's heartbeats, which stop while an engine is
+paused, so the lease must outlast the longest refit.
+
 Startup completes only after the frontend sees the same fixed membership at
-the generation and RL endpoints and advertises the configured model. Worker
+the generation and RL endpoints for both the `backend` and `prefill`
+components and advertises the configured model. Worker
 handles are recorded before readiness checks so partial startup failures can
 be torn down. Shutdown is idempotent and guards the frontend, worker pool,
 NATS, etcd, and temporary state independently.
@@ -71,6 +94,29 @@ passes, the extension and the trainers each abort their own communicators and
 raise, so neither side hangs in NCCL.
 KV-cache invalidation stays outside the generic synchronizer because GRPO's
 cache mode determines where it runs.
+
+## Pausing around a refit
+
+vLLM's layerwise reload materializes parameters while the update runs, so no
+request may execute beside it. The refit channel therefore pauses every engine,
+prefill and decode alike, through Dynamo's `pause_generation` route, which hands
+`mode` and `clear_cache` to vLLM's `pause_generation`. Two modes are used:
+
+- **`keep`** (in-flight weight updates, `DynamoGeneration.pause_generation_for_refit`):
+  the scheduler stops stepping and keeps its requests. They continue on the new
+  weights after `resume_generation`. With `clear_cache`, vLLM also preempts the
+  running requests and clears the KV and prefix caches, so they recompute on the
+  new weights. vLLM raises if a preempted request is a decode request waiting on
+  remote KV, which is why that combination is rejected at setup for a
+  disaggregated fleet.
+- **`wait`** (`drain_for_weight_update`, used by the SingleController, and cache
+  invalidation): running requests finish on the old weights, new ones queue, and
+  caches are cleared once idle.
+
+A pause that fails on any engine resumes the engines that did pause before it
+raises, so a failed refit never leaves part of the fleet frozen. With
+`in_flight_weight_updates` off, the async collector drains its own trajectories
+instead and refits an idle fleet.
 
 ## Dependencies
 
