@@ -164,7 +164,10 @@ def _make_master_config(
             "control_timeout_s": 900.0,
             "disaggregation": None,
         }
-        generation_config["vllm_cfg"] = {"enable_vllm_metrics_logger": False}
+        generation_config["vllm_cfg"] = {
+            "enable_vllm_metrics_logger": False,
+            "expose_http_server": False,
+        }
     master_config = MasterConfig.model_construct(
         data_plane={
             "enabled": dp_enabled,
@@ -364,6 +367,8 @@ def test_build_generation_constructs_dynamo_from_normalized_config():
     mock_dynamo.assert_called_once_with(
         cluster=inference_cluster,
         config=master_config.policy["generation"],
+        tokenizer=None,
+        tokenizer_config=master_config.policy["tokenizer"],
     )
     assert master_config.policy["generation"]["model_name"] == "Qwen/Qwen3-0.6B"
     generation.finish_generation.assert_called_once_with()
@@ -456,6 +461,111 @@ def test_dynamo_accepts_aggregated_fleet_under_the_single_controller():
     assert master_config.policy["generation"]["dynamo_cfg"]["disaggregation"] is None
 
     sc_setup_mod.DynamoGeneration.validate_settings(master_config)
+
+
+def test_dynamo_gym_builds_generation_once_before_gym(patched_factories):
+    """Gym needs the token wrapper URL, which exists only after the fleet is up."""
+    master_config = _dynamo_gym_sc_config()
+    fake_gen = patched_factories["fake_gen"]
+    fake_gen.dp_openai_server_base_urls = ["http://wrapper:3001/v1"]
+    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+    fake_gym_shards = MagicMock(name="nemo_gym_shards")
+    events = []
+
+    def build(*args, **kwargs):
+        # No deferred load: the Dynamo fleet starts with dummy weights.
+        assert not kwargs.get("defer_model_load")
+        events.append("generation")
+        return fake_gen, 3.0
+
+    def spinup(*args, **kwargs):
+        assert events == ["generation"]
+        assert kwargs["base_urls"] == ["http://wrapper:3001/v1"]
+        events.append("gym")
+        return fake_gym_shards
+
+    patched_factories["_build_generation"].side_effect = build
+    tokenizer = MagicMock(pad_token_id=0)
+
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        patch.object(sc_setup_mod.DynamoConfig, "model_validate") as validate,
+        patch.object(
+            sc_setup_mod, "build_nemo_gym_actors", side_effect=spinup
+        ) as mock_spinup,
+        patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+        patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+    ):
+        validate.return_value.model_dump.return_value = master_config.policy[
+            "generation"
+        ]
+        actor_args, timing = setup_single_controller(master_config, tokenizer)
+
+    assert events == ["generation", "gym"]
+    patched_factories["_build_generation"].assert_called_once()
+    assert patched_factories["_build_generation"].call_args.kwargs["tokenizer"] is (
+        tokenizer
+    )
+    mock_spinup.assert_called_once()
+    assert actor_args.gen_handle is fake_gen
+    assert actor_args.env_handles["nemo_gym"] is fake_gym_shards
+    assert timing.generation_init_time_s == 3.0
+    sync_kwargs = patched_factories["create_weight_synchronizer"].call_args.kwargs
+    assert sync_kwargs["generation_backend"] == "dynamo"
+
+
+def _dynamo_gym_sc_config():
+    master_config = _make_master_config(
+        backend="dynamo", env={"should_use_nemo_gym": True}
+    )
+    master_config.policy["model_name"] = "test-model"
+    master_config.policy["generation"].update(
+        {
+            "model_name": "test-model",
+            "stop_strings": None,
+            "stop_token_ids": None,
+            "top_k": None,
+        }
+    )
+    master_config.policy["generation"]["vllm_cfg"]["expose_http_server"] = True
+    return master_config
+
+
+@pytest.mark.parametrize(
+    ("misconfigure", "error", "match"),
+    [
+        pytest.param(
+            lambda mc: mc.policy["generation"]["vllm_cfg"].update(
+                expose_http_server=False
+            ),
+            ValueError,
+            "expose_http_server=true",
+            id="no_http_server",
+        ),
+        pytest.param(
+            lambda mc: setattr(mc.token_capture, "enabled", True),
+            NotImplementedError,
+            "token_capture.enabled is not supported",
+            id="token_capture",
+        ),
+        pytest.param(
+            lambda mc: setattr(mc.async_rl.generation_router, "enabled", True),
+            NotImplementedError,
+            "generation_router.enabled is not supported",
+            id="generation_router",
+        ),
+    ],
+)
+def test_dynamo_gym_unsupported_options_fail_validation(misconfigure, error, match):
+    master_config = _dynamo_gym_sc_config()
+    misconfigure(master_config)
+
+    with pytest.raises(error, match=match):
+        sc_setup_mod.DynamoGeneration.validate_settings(master_config)
+
+
+def test_dynamo_gym_is_accepted_when_the_token_wrapper_is_exposed():
+    sc_setup_mod.DynamoGeneration.validate_settings(_dynamo_gym_sc_config())
 
 
 def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):

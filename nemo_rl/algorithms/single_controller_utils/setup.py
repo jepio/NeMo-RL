@@ -584,7 +584,8 @@ def _build_generation(
         defer_model_load: If True (for the NeMo-Gym flow), reserve OpenAI server URLs without loading weights; caller runs gen.load_and_start() later (vLLM only).
         reserved_http_server_ports: OpenAI server ports pre-published to NeMo-Gym,
             keyed by the distributed rank that adopts each one (Megatron only).
-        tokenizer: Tokenizer for the dedicated Megatron inference policy (Megatron only).
+        tokenizer: Tokenizer for the dedicated Megatron inference policy, and for the
+            token wrapper of managed Dynamo when it serves NeMo-Gym.
         processor: Optional AutoProcessor for VLM paths (Megatron only).
 
     Returns:
@@ -649,6 +650,8 @@ def _build_generation(
         gen = DynamoGeneration(
             cluster=inference_cluster,
             config=cast(dict[str, Any], generation_config),
+            tokenizer=tokenizer,
+            tokenizer_config=master_config.policy.get("tokenizer"),
         )
 
     else:
@@ -1463,9 +1466,13 @@ def setup_single_controller(
     use_nemo_gym = should_use_nemo_gym(master_config)
     data_tokenizer = processor if processor is not None else tokenizer
     is_vlm = processor is not None
-    if use_nemo_gym and generation_config["backend"] not in ("vllm", "megatron"):
+    if use_nemo_gym and generation_config["backend"] not in (
+        "vllm",
+        "megatron",
+        "dynamo",
+    ):
         raise NotImplementedError(
-            "SC NeMo-Gym integration currently supports the vllm and megatron backends only; got "
+            "SC NeMo-Gym integration supports the vllm, megatron, and dynamo backends; got "
             f"{generation_config['backend']!r}"
         )
     # Backend settings checks are pure config: run them before anything builds.
@@ -1546,6 +1553,7 @@ def setup_single_controller(
     generation = None
     defer_generation_model_load = False
     gen_reserve_time = 0.0
+    gen_load_time = 0.0
     # Started inside the use_nemo_gym branch below, not here: main's parallel-build
     # restructure leaves `generation` as None at this point, and the router needs a
     # live generation to front. None is also the correct value whenever the router
@@ -1709,6 +1717,18 @@ def setup_single_controller(
                 flush=True,
             )
             gym_base_urls: list[Optional[str]] = list(megatron_reserved_urls)
+        elif generation_config["backend"] == "dynamo":
+            # Managed Dynamo publishes the URL of its token wrapper only after the
+            # fleet is up. The engines start with dummy weights and answer health
+            # checks, and the first refit delivers the real weights. There is no
+            # deferred load: build the generation once, then start Gym and the
+            # trainer in parallel.
+            generation, gen_load_time = _build_generation(
+                inference_cluster,
+                master_config=master_config,
+                tokenizer=tokenizer,
+            )
+            gym_base_urls = generation.dp_openai_server_base_urls
         else:
             # defer generation, only get base_urls for nemo_gym spinup
             generation, gen_reserve_time = _build_generation(
@@ -1759,7 +1779,7 @@ def setup_single_controller(
                 _finish_deferred_generation,
                 generation=generation,
             )
-        else:
+        elif generation is None:
             build_tasks["generation"] = partial(
                 _build_generation,
                 inference_cluster=inference_cluster,
@@ -1782,7 +1802,8 @@ def setup_single_controller(
                 ].result()
                 gen_load_time = time_metrics["gen_time"]
             else:
-                generation, gen_load_time = submitted["generation"].result()
+                if "generation" in submitted:
+                    generation, gen_load_time = submitted["generation"].result()
                 trainer, value, time_metrics = submitted["trainer"].result()
             if megatron_reserved_urls:
                 # Gym initialization needs a live URL that will respond to health checks.

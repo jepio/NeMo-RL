@@ -219,6 +219,25 @@ class DynamoGeneration(GenerationInterface):
                 "with policy.generation.backend='dynamo' under the SingleController; "
                 "nothing reads the Dynamo metrics sampler on this path."
             )
+        if master_config.env.get("should_use_nemo_gym"):
+            if not generation["vllm_cfg"]["expose_http_server"]:
+                raise ValueError(
+                    "NeMo-Gym under the SingleController needs "
+                    "policy.generation.vllm_cfg.expose_http_server=true with "
+                    "policy.generation.backend='dynamo': Gym talks to the Dynamo "
+                    "token wrapper over HTTP."
+                )
+            if master_config.token_capture.enabled:
+                raise NotImplementedError(
+                    "token_capture.enabled is not supported with "
+                    "policy.generation.backend='dynamo'"
+                )
+            if master_config.async_rl.generation_router.enabled:
+                raise NotImplementedError(
+                    "async_rl.generation_router.enabled is not supported with "
+                    "policy.generation.backend='dynamo'; the Dynamo frontend routes "
+                    "requests, and Gym talks to one token wrapper."
+                )
 
     @staticmethod
     def validate_in_flight_refit(
