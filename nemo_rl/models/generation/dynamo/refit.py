@@ -403,22 +403,10 @@ class DynamoRefitChannel:
         """Receive one nccl_reshard refit on every engine."""
         return self._refit_every_engine("nrl_nccl_reshard_refit", refit_timeout_s, {})
 
-    def _by_role(
-        self,
-    ) -> tuple[list[DynamoWorkerEndpoint], list[DynamoWorkerEndpoint]]:
-        """Split the fleet into prefill engines and every other engine."""
-        prefill = [worker for worker in self._workers if worker.role == "prefill"]
-        others = [worker for worker in self._workers if worker.role != "prefill"]
-        return prefill, others
-
     def _pause_workers(
-        self,
-        workers: Sequence[DynamoWorkerEndpoint],
-        *,
-        mode: PauseMode,
-        clear_cache: bool,
+        self, *, mode: PauseMode, clear_cache: bool
     ) -> tuple[list[DynamoWorkerEndpoint], list[str]]:
-        """Pause the given workers at the same time; new requests wait for resume.
+        """Pause every worker at the same time; new requests wait for resume.
 
         ``wait`` lets running requests finish first. ``keep`` freezes them where
         they are, so they continue after resume.
@@ -430,11 +418,11 @@ class DynamoRefitChannel:
                 payload={"mode": mode, "clear_cache": clear_cache},
                 timeout_s=self._control_timeout_s,
             )
-            for worker in workers
+            for worker in self._workers
         ]
         paused_workers: list[DynamoWorkerEndpoint] = []
         pause_errors: list[str] = []
-        for worker, future in zip(workers, pause_futures, strict=True):
+        for worker, future in zip(self._workers, pause_futures, strict=True):
             try:
                 ray.get(future)
             except Exception as error:
@@ -443,42 +431,16 @@ class DynamoRefitChannel:
                 paused_workers.append(worker)
         return paused_workers, pause_errors
 
-    def _pause_in_order(
-        self, *, mode: PauseMode, clear_cache: bool
-    ) -> tuple[list[DynamoWorkerEndpoint], list[str]]:
-        """Pause prefill engines first and wait for them, then every other engine.
-
-        A prefill engine holds the KV of a finished request until a decode engine
-        pulls it, and a paused decode engine pulls nothing. Pausing both at once
-        therefore stalls the prefill pause for up to one KV lease. With prefill
-        first, the decode engines still step, pull the pending KV, and let the
-        prefill pause finish. Nothing is left in flight when decode pauses.
-
-        Prefill engines always use ``wait``: ``keep`` would freeze a chunked
-        prefill in the middle of a prompt, and that prompt would end up with KV
-        from two weight versions. Short prefills finish on the old weights and
-        hand off to decode before the decode engines pause.
-
-        Without prefill engines, this is one pause of every engine at once.
-        """
-        prefill, others = self._by_role()
-        paused, errors = self._pause_workers(
-            prefill, mode="wait", clear_cache=clear_cache
-        )
-        if errors:
-            return paused, errors
-        more_paused, more_errors = self._pause_workers(
-            others, mode=mode, clear_cache=clear_cache
-        )
-        return paused + more_paused, more_errors
-
     def _resume_workers(
         self, workers: Sequence[DynamoWorkerEndpoint], *, timeout_s: float
     ) -> list[str]:
         """Resume decode and aggregated engines first, then prefill engines.
 
-        A prefill engine that resumes while a decode engine is still paused would
-        finish requests whose KV nobody can pull yet.
+        A paused decode engine sends no heartbeat, so the leases of the KV that a
+        prefill engine holds for it run on during the pause. The first step of a
+        resumed decode engine sends the heartbeat that extends them. A resumed
+        prefill engine expires the leases that ended, so it must not resume before
+        the decode engines can heartbeat.
         """
         resume_errors: list[str] = []
         for group in (
@@ -510,27 +472,55 @@ class DynamoRefitChannel:
         An engine whose pause call timed out can still finish pausing later, so a
         resume goes to every engine and not only to those that confirmed. Dynamo
         runs pause and resume under one lock, so the resume lands after a late
-        pause. A resume on an engine that never paused changes nothing.
+        pause. A resume on an engine that never paused changes nothing. Decode and
+        aggregated engines resume before prefill engines.
         """
         return self._resume_workers(
             self._workers,
             timeout_s=self._control_timeout_s * _ROLLBACK_TIMEOUT_FACTOR,
         )
 
+    @property
+    def is_disaggregated(self) -> bool:
+        """Whether the fleet has separate prefill and decode engines."""
+        return any(worker.role != "aggregated" for worker in self._workers)
+
     def pause(self, *, mode: PauseMode, clear_cache: bool) -> None:
         """Pause every worker ahead of a weight update.
 
         With ``mode="wait"`` running requests finish on the current weights;
-        with ``mode="keep"`` they are frozen and continue on the new ones. A
-        prefill engine always waits (see :meth:`_pause_in_order`). If any engine
-        fails to pause, every engine is resumed before the error is raised.
+        with ``mode="keep"`` they are frozen and continue on the new ones. All
+        engines pause at the same time. The pause of a prefill engine does not
+        wait for KV that a decode engine has not pulled, because the patched vLLM
+        scheduler ignores held KV for a ``keep`` pause (see
+        ``_patch_vllm_pause_with_held_kv``). If any engine fails to pause, every
+        engine is resumed before the error is raised.
 
         Args:
-            mode: How decode and aggregated engines treat requests they are running.
+            mode: How workers treat requests they are running.
             clear_cache: Clear each engine's KV and prefix caches once paused, so
-                kept requests recompute their KV after the update.
+                kept requests recompute their KV after the update. Not allowed on
+                a prefill/decode fleet.
+
+        Raises:
+            ValueError: If ``clear_cache`` is set on a prefill/decode fleet, or
+                ``mode="wait"`` is used there. No request is sent in these cases.
+            RuntimeError: If any engine fails to pause.
         """
-        _, pause_errors = self._pause_in_order(mode=mode, clear_cache=clear_cache)
+        if self.is_disaggregated and clear_cache:
+            raise ValueError(
+                "A prefill/decode fleet cannot clear its caches while it pauses: "
+                "the prefill engines still hold KV for the decode engines, and "
+                "vLLM raises when a cache clear cannot free it."
+            )
+        if self.is_disaggregated and mode == "wait":
+            raise ValueError(
+                "A prefill/decode fleet cannot pause in 'wait' mode: a decode "
+                "engine in that state admits no request that waits for remote KV, "
+                "so the pause of a prefill engine waits for the KV lease. Use "
+                "'keep' mode."
+            )
+        _, pause_errors = self._pause_workers(mode=mode, clear_cache=clear_cache)
         if pause_errors:
             resume_errors = self._roll_back_pause()
             details = f"pause (mode={mode}) failed for " + "; ".join(pause_errors)
@@ -550,8 +540,14 @@ class DynamoRefitChannel:
             )
 
     def flush_cache(self) -> bool:
-        """Drain, clear, and resume every worker using immutable endpoints."""
-        _, pause_errors = self._pause_in_order(mode="wait", clear_cache=True)
+        """Drain, clear, and resume every worker using immutable endpoints.
+
+        Use this only when no request is in flight, for example after the async
+        collector has drained every trajectory. On a prefill/decode fleet with
+        requests in flight, a ``wait`` pause stalls on a prefill engine's held KV
+        and the cache clear can raise.
+        """
+        _, pause_errors = self._pause_workers(mode="wait", clear_cache=True)
         if pause_errors:
             resume_errors = self._roll_back_pause()
         else:

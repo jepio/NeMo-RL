@@ -158,17 +158,21 @@ class DynamoDisaggregationConfig(BaseModel, extra="forbid"):
         prefill_workers: Number of prefill-only engines.
         decode_workers: Number of decode-only engines.
         kv_lease_duration_s: Seconds a prefill engine holds a request's KV blocks
-            for a decode engine to pull. Decode engines renew the lease while they
-            step. A weight update pauses prefill engines first and waits until
-            decode has pulled their pending KV, so this is also the longest that
-            the prefill pause can wait. Keep it shorter than
-            ``dynamo_cfg.control_timeout_s``. A lease that ends before the pull
-            frees the blocks, and the decode engine then prefills locally.
+            for a decode engine to pull. Decode engines renew the lease only while
+            they step, and a weight update freezes them for the whole pause. The
+            prefill engine frees the blocks when the lease ends, even if the
+            decode engine has not pulled them. A decode engine does not check the
+            lease before it reads, so it can then read freed memory and use wrong
+            KV without an error. Keep the lease longer than the longest pause,
+            which a refit bounds with ``dynamo_cfg.control_timeout_s``. Setup
+            requires at least twice that time. The cost of a long lease is that
+            KV from a lost handoff stays allocated on the prefill engine until it
+            ends.
     """
 
     prefill_workers: PositiveInt
     decode_workers: PositiveInt
-    kv_lease_duration_s: PositiveInt = 120
+    kv_lease_duration_s: PositiveInt = 1800
 
 
 class DynamoCfg(BaseModel, extra="forbid"):
@@ -185,18 +189,20 @@ class DynamoCfg(BaseModel, extra="forbid"):
     metrics_exclude_prefixes: list[str] | None
 
     @model_validator(mode="after")
-    def _validate_kv_lease_fits_control_timeout(self) -> "DynamoCfg":
+    def _validate_kv_lease_outlasts_a_refit(self) -> "DynamoCfg":
         disaggregation = self.disaggregation
         if (
             disaggregation is not None
-            and disaggregation.kv_lease_duration_s >= self.control_timeout_s
+            and disaggregation.kv_lease_duration_s < 2 * self.control_timeout_s
         ):
             raise ValueError(
                 "dynamo_cfg.disaggregation.kv_lease_duration_s "
-                f"({disaggregation.kv_lease_duration_s}) must be less than "
-                f"control_timeout_s ({self.control_timeout_s}): a prefill pause can "
-                "wait one lease for pending KV, and the pause call would time out "
-                "first."
+                f"({disaggregation.kv_lease_duration_s}) must be at least twice "
+                f"control_timeout_s ({self.control_timeout_s}). Decode engines "
+                "send no heartbeat while a refit pauses them. A prefill engine "
+                "frees KV when the lease ends, and a decode engine can then read "
+                "wrong KV without an error. The lease must cover the refit and a "
+                "rollback."
             )
         return self
 

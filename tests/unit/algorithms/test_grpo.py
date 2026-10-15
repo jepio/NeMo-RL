@@ -3220,11 +3220,7 @@ def test_setup_rejects_in_flight_cache_clearing_on_a_disaggregated_fleet(
             "enabled": False,
             "resources": {"gpus_per_node": 2, "num_nodes": 1},
         },
-        disaggregation={
-            "prefill_workers": 1,
-            "decode_workers": 1,
-            "kv_lease_duration_s": 10,
-        },
+        disaggregation={"prefill_workers": 1, "decode_workers": 1},
     )
     master_config.grpo.async_grpo.in_flight_weight_updates = True
     master_config.grpo.async_grpo.recompute_kv_cache_after_weight_updates = True

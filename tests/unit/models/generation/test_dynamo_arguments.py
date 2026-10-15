@@ -408,7 +408,7 @@ def test_disaggregated_worker_argv_owns_role_and_nixl_configuration() -> None:
     dynamo_cfg["disaggregation"] = {
         "prefill_workers": 1,
         "decode_workers": 1,
-        "kv_lease_duration_s": 100,
+        "kv_lease_duration_s": 1200,
     }
     cfg = DynamoCfg.model_validate(dynamo_cfg)
     common = {
@@ -435,7 +435,7 @@ def test_disaggregated_worker_argv_owns_role_and_nixl_configuration() -> None:
         "kv_role": "kv_both",
         # A lapsed lease or failed pull must recompute, not fail the rollout.
         "kv_load_failure_policy": "recompute",
-        "kv_connector_extra_config": {"kv_lease_duration": 100},
+        "kv_connector_extra_config": {"kv_lease_duration": 1200},
     }
     assert _flag_value(decode_argv, "--disaggregation-mode") == "decode"
     assert json.loads(_flag_value(decode_argv, "--kv-transfer-config")) == nixl_config
@@ -450,24 +450,24 @@ def test_disaggregated_worker_argv_owns_role_and_nixl_configuration() -> None:
     }
 
 
-def test_disaggregated_kv_lease_defaults_below_the_control_timeout() -> None:
+def test_disaggregated_kv_lease_defaults_to_outlast_a_refit() -> None:
     cfg = DynamoCfg.model_validate(
         {
             **_dynamo_cfg(),
             "disaggregation": {"prefill_workers": 1, "decode_workers": 2},
         }
     )
-    assert cfg.disaggregation.kv_lease_duration_s == 120
-    assert cfg.disaggregation.kv_lease_duration_s < cfg.control_timeout_s
+    assert cfg.disaggregation.kv_lease_duration_s == 1800
+    assert cfg.disaggregation.kv_lease_duration_s >= 2 * cfg.control_timeout_s
 
 
-@pytest.mark.parametrize("lease_s", [600, 601])
-def test_disaggregated_kv_lease_must_be_shorter_than_the_control_timeout(
+@pytest.mark.parametrize("lease_s", [1199, 600, 30])
+def test_disaggregated_kv_lease_must_be_at_least_twice_the_control_timeout(
     lease_s,
 ) -> None:
-    # A prefill pause can wait one lease for pending KV; the pause call would time
-    # out first.
-    with pytest.raises(ValueError, match="must be less than control_timeout_s"):
+    # Decode engines send no heartbeat during a refit pause. A lease that ends
+    # first frees KV that decode has not read, and decode then reads wrong KV.
+    with pytest.raises(ValueError, match="at least twice control_timeout_s"):
         DynamoCfg.model_validate(
             {
                 **_dynamo_cfg(),
@@ -478,6 +478,19 @@ def test_disaggregated_kv_lease_must_be_shorter_than_the_control_timeout(
                 },
             }
         )
+
+
+def test_disaggregated_kv_lease_of_exactly_twice_the_control_timeout_is_valid() -> None:
+    DynamoCfg.model_validate(
+        {
+            **_dynamo_cfg(),
+            "disaggregation": {
+                "prefill_workers": 1,
+                "decode_workers": 1,
+                "kv_lease_duration_s": 1200,
+            },
+        }
+    )
 
 
 def test_kv_lease_is_not_checked_without_disaggregation() -> None:

@@ -666,34 +666,71 @@ def _prefill_decode_channel(monkeypatch, *, fail=frozenset()):
     return channel, events
 
 
-@pytest.mark.parametrize("decode_mode", ["keep", "wait"])
-def test_pause_confirms_prefill_before_it_pauses_decode(
-    monkeypatch, decode_mode
+def test_pd_pause_sends_keep_to_every_engine_before_reading_any_result(
+    monkeypatch,
 ) -> None:
     channel, events = _prefill_decode_channel(monkeypatch)
 
-    channel.pause(mode=decode_mode, clear_cache=False)
+    channel.pause(mode="keep", clear_cache=False)
 
-    # Decode must keep stepping, so it can pull the KV that prefill still holds,
-    # until prefill has confirmed its pause. Prefill never uses keep mode.
+    # The patched vLLM scheduler lets a keep pause finish while prefill holds KV,
+    # so no engine waits for another and both pauses go out together.
     assert events == [
         (
             "post",
             "pause_generation",
-            "http://prefill:4000",
-            {"mode": "wait", "clear_cache": False},
+            "http://decode:4000",
+            {"mode": "keep", "clear_cache": False},
             10,
         ),
-        ("done", "pause_generation", "http://prefill:4000"),
         (
             "post",
             "pause_generation",
-            "http://decode:4000",
-            {"mode": decode_mode, "clear_cache": False},
+            "http://prefill:4000",
+            {"mode": "keep", "clear_cache": False},
             10,
         ),
         ("done", "pause_generation", "http://decode:4000"),
+        ("done", "pause_generation", "http://prefill:4000"),
     ]
+
+
+@pytest.mark.parametrize(
+    ("mode", "clear_cache", "match"),
+    [
+        ("keep", True, "cannot clear its caches"),
+        ("wait", True, "cannot clear its caches"),
+        ("wait", False, "cannot pause in 'wait' mode"),
+    ],
+)
+def test_pd_pause_rejects_unsafe_modes_before_any_request(
+    monkeypatch, mode, clear_cache, match
+) -> None:
+    channel, events = _prefill_decode_channel(monkeypatch)
+
+    with pytest.raises(ValueError, match=match):
+        channel.pause(mode=mode, clear_cache=clear_cache)
+
+    assert events == []
+
+
+def test_aggregated_fleet_may_clear_its_cache_and_wait(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(
+        refit_module._post_worker_route,
+        "remote",
+        lambda **kwargs: calls.append(kwargs["payload"]) or kwargs["system_url"],
+    )
+    monkeypatch.setattr(refit_module.ray, "get", lambda ref: True)
+    channel = DynamoRefitChannel(
+        [{"instance_id": "a", "system_url": "http://a:4000", "role": "aggregated"}],
+        engine_world_size=1,
+        control_timeout_s=10,
+    )
+
+    channel.pause(mode="wait", clear_cache=True)
+
+    assert calls == [{"mode": "wait", "clear_cache": True}]
 
 
 def test_resume_restarts_decode_before_prefill(monkeypatch) -> None:
@@ -701,6 +738,8 @@ def test_resume_restarts_decode_before_prefill(monkeypatch) -> None:
 
     channel.resume()
 
+    # A resumed decode engine sends the heartbeat that extends the KV leases. A
+    # prefill engine expires ended leases when it resumes, so it goes last.
     assert events == [
         ("post", "resume_generation", "http://decode:4000", {}, 10),
         ("done", "resume_generation", "http://decode:4000"),
@@ -709,57 +748,53 @@ def test_resume_restarts_decode_before_prefill(monkeypatch) -> None:
     ]
 
 
-def test_failed_prefill_pause_never_pauses_decode_and_resumes_everything(
-    monkeypatch,
+@pytest.mark.parametrize("failing_role", ["decode", "prefill"])
+def test_failed_pd_pause_resumes_both_roles_decode_first(
+    monkeypatch, failing_role
 ) -> None:
     channel, events = _prefill_decode_channel(
-        monkeypatch, fail={("pause_generation", "http://prefill:4000")}
+        monkeypatch, fail={("pause_generation", f"http://{failing_role}:4000")}
     )
 
     with pytest.raises(RuntimeError, match="pause \\(mode=keep\\) failed"):
         channel.pause(mode="keep", clear_cache=False)
 
     posts = [(event[1], event[2]) for event in events if event[0] == "post"]
+    # The failed engine gets a resume too: its pause call can still finish later.
     assert posts == [
-        ("pause_generation", "http://prefill:4000"),
-        ("resume_generation", "http://decode:4000"),
-        ("resume_generation", "http://prefill:4000"),
-    ]
-    # The resume queues behind a pause that timed out, so it waits twice as long.
-    assert {
-        event[4] for event in events if event[:2] == ("post", "resume_generation")
-    } == {20}
-
-
-def test_failed_decode_pause_resumes_both_roles_in_order(monkeypatch) -> None:
-    channel, events = _prefill_decode_channel(
-        monkeypatch, fail={("pause_generation", "http://decode:4000")}
-    )
-
-    with pytest.raises(RuntimeError, match="pause \\(mode=keep\\) failed"):
-        channel.pause(mode="keep", clear_cache=False)
-
-    posts = [(event[1], event[2]) for event in events if event[0] == "post"]
-    assert posts == [
-        ("pause_generation", "http://prefill:4000"),
         ("pause_generation", "http://decode:4000"),
+        ("pause_generation", "http://prefill:4000"),
         ("resume_generation", "http://decode:4000"),
         ("resume_generation", "http://prefill:4000"),
     ]
+    # The resume queues behind a pause call that timed out, so it waits twice as long.
+    resume_timeouts = {
+        event[4] for event in events if event[:2] == ("post", "resume_generation")
+    }
+    assert resume_timeouts == {20}
 
 
-def test_flush_cache_pauses_prefill_first_and_resumes_decode_first(
+def test_flush_cache_is_for_an_idle_fleet_and_resumes_decode_first(
     monkeypatch,
 ) -> None:
     channel, events = _prefill_decode_channel(monkeypatch)
 
     assert channel.flush_cache() is True
 
-    assert [(event[1], event[2]) for event in events if event[0] == "post"] == [
-        ("pause_generation", "http://prefill:4000"),
-        ("pause_generation", "http://decode:4000"),
-        ("resume_generation", "http://decode:4000"),
-        ("resume_generation", "http://prefill:4000"),
+    posts = [(event[1], event[2], event[3]) for event in events if event[0] == "post"]
+    assert posts == [
+        (
+            "pause_generation",
+            "http://decode:4000",
+            {"mode": "wait", "clear_cache": True},
+        ),
+        (
+            "pause_generation",
+            "http://prefill:4000",
+            {"mode": "wait", "clear_cache": True},
+        ),
+        ("resume_generation", "http://decode:4000", {}),
+        ("resume_generation", "http://prefill:4000", {}),
     ]
 
 
