@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from nemo_rl.models.generation.dynamo import dynamo_worker as dynamo_worker_module
 from nemo_rl.models.generation.dynamo import venv as dynamo_venv
 from nemo_rl.models.generation.dynamo.dynamo_worker import (
     DynamoGpuReservation,
@@ -578,6 +579,28 @@ def test_worker_registers_process_group_immediately_after_launch(
     assert command[command.index("--disaggregation-mode") + 1] == "prefill"
     kv_event_config = json.loads(command[command.index("--kv-events-config") + 1])
     assert kv_event_config["endpoint"] == "tcp://*:4200"
+
+
+@pytest.mark.parametrize(
+    ("inherited", "expected_e8m0"),
+    [
+        ({}, "0"),
+        ({"VLLM_USE_DEEP_GEMM_E8M0": "1"}, "1"),
+    ],
+)
+def test_fp8_defaults_do_not_override_an_explicit_e8m0_setting(
+    inherited, expected_e8m0
+) -> None:
+    defaults = {"VLLM_USE_DEEP_GEMM": "1", "VLLM_USE_DEEP_GEMM_E8M0": "0"}
+
+    env = dynamo_worker_module._env_with_fp8_defaults(
+        {"VLLM_USE_DEEP_GEMM": "0", "PATH": "/bin", **inherited}, defaults
+    )
+
+    # DeepGEMM itself is always set, as init_fp8 does; E8M0 is only a default.
+    assert env["VLLM_USE_DEEP_GEMM"] == "1"
+    assert env["VLLM_USE_DEEP_GEMM_E8M0"] == expected_e8m0
+    assert env["PATH"] == "/bin"
 
 
 def test_shutdown_guards_each_owned_resource_independently(monkeypatch) -> None:

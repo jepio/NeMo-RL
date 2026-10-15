@@ -75,6 +75,23 @@ def _fp8_engine_args(
     )
 
 
+def _env_with_fp8_defaults(
+    base_env: dict[str, str], engine_env_defaults: dict[str, str]
+) -> dict[str, str]:
+    """Apply the FP8 engine environment with the precedence ``init_fp8`` uses.
+
+    ``VLLM_USE_DEEP_GEMM_E8M0`` is only a default, so a value that the process
+    already has wins. Every other FP8 variable is set.
+    """
+    env = dict(base_env)
+    for name, value in engine_env_defaults.items():
+        if name == "VLLM_USE_DEEP_GEMM_E8M0":
+            env.setdefault(name, value)
+        else:
+            env[name] = value
+    return env
+
+
 @ray.remote(num_cpus=0)
 class DynamoGpuReservation:  # pragma: no cover
     """Hold one placement-group GPU while a sibling actor owns the engine."""
@@ -223,7 +240,7 @@ class DynamoVllmWorker:  # pragma: no cover
                 }
             )
         worker_env = build_managed_worker_env(
-            base_env={**os.environ, **engine_env_defaults},
+            base_env=_env_with_fp8_defaults(dict(os.environ), engine_env_defaults),
             configured_env=configured_env,
             manager_env=managed_worker_env,
         )

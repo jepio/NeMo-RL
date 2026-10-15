@@ -49,7 +49,7 @@ def _vllm_port_for_node_slot(node_slot: int) -> int:
 def _nixl_port_for_node_slot(node_slot: int) -> int:
     """Return the managed node-local NIXL side-channel port.
 
-    One port per engine group is enough for vLLM 0.23.0: its NIXL scheduler
+    One port per engine group is enough for vLLM 0.29: its NIXL scheduler
     serves every TP rank's handshake from one listener on
     ``VLLM_NIXL_SIDE_CHANNEL_PORT + data_parallel_index``, and managed engines
     run with DP=1.
