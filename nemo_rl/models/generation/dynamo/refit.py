@@ -23,7 +23,7 @@ NCCL, exactly as for the vLLM backend.
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import ray
 
@@ -45,6 +45,9 @@ _UPDATE_ROUTE = "update_weights_from_distributed"
 _INIT_ROUTE_CLIENT_MARGIN_S = 30.0
 # Margin past a refit's own deadline for the HTTP call that carries it.
 _REFIT_CLIENT_MARGIN_S = 60.0
+
+# vLLM pause modes the managed fleet uses; Dynamo's pause route also accepts "abort".
+PauseMode = Literal["wait", "keep"]
 
 
 @dataclass(frozen=True)
@@ -388,13 +391,19 @@ class DynamoRefitChannel:
         """Receive one nccl_reshard refit on every engine."""
         return self._refit_every_engine("nrl_nccl_reshard_refit", refit_timeout_s, {})
 
-    def _pause_workers(self) -> tuple[list[DynamoWorkerEndpoint], list[str]]:
-        """Drain in-flight requests and clear caches; new requests wait for resume."""
+    def _pause_workers(
+        self, *, mode: PauseMode, clear_cache: bool
+    ) -> tuple[list[DynamoWorkerEndpoint], list[str]]:
+        """Pause every worker; new requests wait for resume.
+
+        ``wait`` lets running requests finish first. ``keep`` freezes them where
+        they are, so they continue after resume.
+        """
         pause_futures = [
             _post_worker_route.remote(
                 system_url=worker.system_url,
                 route="pause_generation",
-                payload={"mode": "wait", "clear_cache": True},
+                payload={"mode": mode, "clear_cache": clear_cache},
                 timeout_s=self._control_timeout_s,
             )
             for worker in self._workers
@@ -431,15 +440,24 @@ class DynamoRefitChannel:
                 resume_errors.append(f"{worker.system_url}: {error}")
         return resume_errors
 
-    def pause(self) -> None:
-        """Drain and pause every worker ahead of a weight update.
+    def pause(self, *, mode: PauseMode, clear_cache: bool) -> None:
+        """Pause every worker ahead of a weight update.
 
-        Workers that confirmed the pause are resumed if any peer fails.
+        With ``mode="wait"`` running requests finish on the current weights;
+        with ``mode="keep"`` they are frozen and continue on the new ones. Workers
+        that confirmed the pause are resumed if any peer fails.
+
+        Args:
+            mode: How workers treat requests they are running.
+            clear_cache: Clear each engine's KV and prefix caches once paused, so
+                kept requests recompute their KV after the update.
         """
-        paused_workers, pause_errors = self._pause_workers()
+        paused_workers, pause_errors = self._pause_workers(
+            mode=mode, clear_cache=clear_cache
+        )
         if pause_errors:
             resume_errors = self._resume_workers(paused_workers)
-            details = "pause/clear failed for " + "; ".join(pause_errors)
+            details = f"pause (mode={mode}) failed for " + "; ".join(pause_errors)
             if resume_errors:
                 details += "; resume failed for " + "; ".join(resume_errors)
             raise RuntimeError(f"Dynamo pause before weight update failed: {details}")
@@ -455,7 +473,9 @@ class DynamoRefitChannel:
 
     def flush_cache(self) -> bool:
         """Drain, clear, and resume every worker using immutable endpoints."""
-        paused_workers, pause_errors = self._pause_workers()
+        paused_workers, pause_errors = self._pause_workers(
+            mode="wait", clear_cache=True
+        )
         resume_errors = self._resume_workers(paused_workers)
 
         if pause_errors or resume_errors:

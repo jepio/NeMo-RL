@@ -2789,18 +2789,45 @@ class TestAsyncTrajectoryCollector:
 
         assert collector._refit_pause_cleared.is_set()
 
-    def test_dynamo_prepare_for_refit_drains_pending_generations(self):
-        """Dynamo layerwise reload never overlaps an active generation."""
+    def test_dynamo_in_flight_refit_pauses_with_the_native_contract(self):
+        """Managed Dynamo freezes in-flight requests instead of draining them."""
         collector = self.create_local_collector()
         collector.master_config.policy["generation"] = {
             "backend": "dynamo",
             "dynamo_cfg": {},
         }
-        collector.master_config.grpo.async_grpo.in_flight_weight_updates = True
+        async_cfg = collector.master_config.grpo.async_grpo
+        async_cfg.in_flight_weight_updates = True
+        async_cfg.recompute_kv_cache_after_weight_updates = True
         collector.wait_for_pending_generations = mock.MagicMock()
 
         collector.prepare_for_refit()
 
+        assert collector.policy_generation.pause_generation_for_refit_calls == [True]
+        collector.wait_for_pending_generations.assert_not_called()
+        assert not collector._refit_pause_cleared.is_set()
+
+        collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=True)
+        collector.resume_after_refit()
+
+        # The cache was already cleared at pause time, so resume must not flush again.
+        assert collector.policy_generation.resume_generation_after_refit_calls == 1
+        collector.policy_generation.invalidate_kv_cache.assert_not_called()
+        assert collector._refit_pause_cleared.is_set()
+
+    def test_dynamo_refit_drains_pending_generations_when_in_flight_disabled(self):
+        """Without in-flight updates the collector still waits for every trajectory."""
+        collector = self.create_local_collector()
+        collector.master_config.policy["generation"] = {
+            "backend": "dynamo",
+            "dynamo_cfg": {},
+        }
+        collector.master_config.grpo.async_grpo.in_flight_weight_updates = False
+        collector.wait_for_pending_generations = mock.MagicMock()
+
+        collector.prepare_for_refit()
+
+        assert collector.policy_generation.pause_generation_for_refit_calls == []
         collector.wait_for_pending_generations.assert_called_once_with()
 
     def test_calculate_target_weights(self):

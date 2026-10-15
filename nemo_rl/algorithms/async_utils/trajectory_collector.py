@@ -1048,12 +1048,13 @@ class AsyncTrajectoryCollector:
     def prepare_for_refit(self) -> None:
         """Pause new generation starts and optionally wait for pending generations.
 
-        Every async backend configured for in-flight weight updates, except managed
-        Dynamo, is asked to pause generation. vLLM preserves in-flight request state
-        with its native keep-mode pause. Backends without pause support warn and
-        retain their existing behavior. Managed Dynamo drains active trajectories.
+        Every async backend configured for in-flight weight updates is asked to
+        pause generation. vLLM and managed Dynamo preserve in-flight request state
+        with vLLM's native keep-mode pause. Backends without pause support warn and
+        retain their existing behavior.
 
-        For non-async engines, waits for all pending generations to complete before refit.
+        For non-async engines, or when in-flight updates are off, waits for all
+        pending generations to complete before refit.
         """
         start_time = time.time()
         print("🔄 Preparing for refit: pausing new generations...")
@@ -1067,14 +1068,7 @@ class AsyncTrajectoryCollector:
         # Check if we're using async engine
         generation_cfg = self.master_config.policy["generation"]
         backend = generation_cfg["backend"]
-        if backend == "dynamo":
-            # Dynamo refits through update routes called with allow_unpaused=True,
-            # so a request already in an engine would decode on half-updated
-            # weights. Stop new trajectory starts above and drain every active
-            # trajectory before refitting.
-            is_async_engine = False
-        else:
-            is_async_engine = should_use_async_rollouts(generation_cfg)
+        is_async_engine = should_use_async_rollouts(generation_cfg)
         in_flight_weight_updates = self.async_config.in_flight_weight_updates
 
         if is_async_engine and in_flight_weight_updates:

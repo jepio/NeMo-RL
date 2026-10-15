@@ -192,6 +192,44 @@ class DynamoGeneration(GenerationInterface):
                 "nothing reads the Dynamo metrics sampler on this path."
             )
 
+    @staticmethod
+    def validate_in_flight_refit(
+        generation_config: dict[str, Any],
+        *,
+        in_flight_weight_updates: bool,
+        recompute_kv_cache_after_weight_updates: bool,
+    ) -> None:
+        """Reject in-flight refit settings the managed fleet cannot honor.
+
+        In-flight updates freeze requests with vLLM's keep-mode pause. Clearing the
+        cache at that pause preempts the engine's running requests, and vLLM cannot
+        do that for a decode request that is waiting on remote KV from a prefill
+        worker, so it raises. Without the clear, a paused disaggregated fleet is fine.
+
+        Args:
+            generation_config: ``policy.generation``, already normalized through
+                :class:`DynamoConfig`.
+            in_flight_weight_updates: ``grpo.async_grpo.in_flight_weight_updates``.
+            recompute_kv_cache_after_weight_updates:
+                ``grpo.async_grpo.recompute_kv_cache_after_weight_updates``.
+
+        Raises:
+            ValueError: On in-flight updates that clear the KV cache over a
+                prefill/decode-disaggregated fleet.
+        """
+        disaggregated = generation_config["dynamo_cfg"]["disaggregation"] is not None
+        if (
+            in_flight_weight_updates
+            and recompute_kv_cache_after_weight_updates
+            and disaggregated
+        ):
+            raise ValueError(
+                "grpo.async_grpo.recompute_kv_cache_after_weight_updates must be "
+                "false when in_flight_weight_updates is true and "
+                "policy.generation.dynamo_cfg.disaggregation is set: vLLM cannot "
+                "clear the KV cache while decode requests await remote KV transfer."
+            )
+
     def __init__(
         self,
         cluster: Optional[RayVirtualCluster],
@@ -793,14 +831,33 @@ class DynamoGeneration(GenerationInterface):
 
     def drain_for_weight_update(self) -> None:
         """Drain and pause every worker; layerwise reload is unsafe mid-request."""
-        channel = self._refit_channel
-        if channel is None:
-            raise RuntimeError("Dynamo refit channel is unavailable")
-        channel.pause()
+        self._require_refit_channel().pause(mode="wait", clear_cache=True)
 
     def resume_after_weight_update(self) -> None:
         """Resume every worker after a weight update."""
-        channel = self._refit_channel
-        if channel is None:
-            raise RuntimeError("Dynamo refit channel is unavailable")
-        channel.resume()
+        self._require_refit_channel().resume()
+
+    def pause_generation_for_refit(self, *, clear_cache: bool) -> bool:
+        """Freeze every engine's in-flight requests for an in-flight weight update.
+
+        Each engine stops stepping, so layerwise reload never runs beside a request,
+        and keeps its requests; they continue on the new weights after
+        :meth:`resume_generation_after_refit`. New requests queue until then.
+
+        Args:
+            clear_cache: Clear each engine's KV and prefix caches while paused, so
+                kept requests recompute their KV on the new weights.
+
+        Returns:
+            True once every engine has paused.
+
+        Raises:
+            RuntimeError: If any engine fails to pause; engines that did are resumed.
+        """
+        self._require_refit_channel().pause(mode="keep", clear_cache=clear_cache)
+        return True
+
+    def resume_generation_after_refit(self) -> bool:
+        """Resume every engine paused by :meth:`pause_generation_for_refit`."""
+        self._require_refit_channel().resume()
+        return True

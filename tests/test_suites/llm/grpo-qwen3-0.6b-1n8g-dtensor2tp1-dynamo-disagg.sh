@@ -56,22 +56,23 @@ grep -Fq "'prefill': 1" <<< "${component_ready_line}"
 # remote-prefill kv_transfer_params (vllm/distributed/kv_transfer/kv_connector/v1/nixl).
 grep -F "NIXL compatibility check passed" "${RUN_LOG}"
 
+# The recipe refits in flight without clearing caches: vLLM cannot clear them while
+# decode requests await remote KV. Every refit must be bracketed by a keep-mode
+# pause and resume on both prefill and decode engines, with no drain or flush.
 grep -F "Performing policy generation refit" "${RUN_LOG}"
-grep -F "Invalidated generation backend KV caches after weight update" "${RUN_LOG}"
-
 refit_count=$(grep -Fc "Performing policy generation refit" "${RUN_LOG}" || true)
-cache_success_count=$(grep -Fc \
-  "Invalidated generation backend KV caches after weight update" \
-  "${RUN_LOG}" || true)
-if [[ "${refit_count}" -eq 0 || "${cache_success_count}" -ne "${refit_count}" ]]; then
-  echo "Expected one successful cache invalidation per refit; refits=${refit_count}, successes=${cache_success_count}" >&2
+pause_count=$(grep -Fc "Requesting dynamo generation pause before refit" "${RUN_LOG}" || true)
+resume_count=$(grep -Fc "Requesting dynamo generation resume after refit" "${RUN_LOG}" || true)
+if [[ "${refit_count}" -eq 0 || "${pause_count}" -ne "${refit_count}" || "${resume_count}" -ne "${refit_count}" ]]; then
+  echo "Expected one pause and one resume per refit; refits=${refit_count}, pauses=${pause_count}, resumes=${resume_count}" >&2
   exit 1
 fi
 if grep -Fq \
+  -e "Invalidated generation backend KV caches after weight update" \
   -e "Failed to invalidate generation backend KV caches" \
-  -e "KV cache invalidation not supported or only partially applied" \
+  -e "Non-async engine: waiting for all pending generations" \
   "${RUN_LOG}"; then
-  echo "The Dynamo run reported a cache invalidation failure" >&2
+  echo "An in-flight refit drained or flushed instead of pausing" >&2
   exit 1
 fi
 

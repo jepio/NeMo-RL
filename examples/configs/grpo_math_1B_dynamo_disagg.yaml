@@ -1,12 +1,23 @@
 # Two-step, three-GPU smoke for managed Dynamo prefill/decode disaggregation.
 defaults: grpo_math_1B_dynamo.yaml
 
+# Refit in flight: vLLM freezes requests in keep mode instead of draining them. It
+# cannot also clear the KV cache while decode requests await remote KV, so the
+# cache is kept (validate_in_flight_refit rejects true here).
+grpo:
+  async_grpo:
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+
 policy:
   generation:
     dynamo_cfg:
       disaggregation:
         prefill_workers: 1
         decode_workers: 1
+        # Seconds a prefill engine holds KV for a decode engine to pull. Keep it
+        # longer than the longest refit: in-flight updates freeze both engines.
+        kv_lease_duration_s: 600
     colocated:
       resources:
         gpus_per_node: 2

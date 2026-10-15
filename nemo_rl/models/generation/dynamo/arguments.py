@@ -159,11 +159,25 @@ def build_dynamo_vllm_argv(
             worker_role,
             source="managed disaggregation",
         )
-        # vLLM 0.23.0 logs a deprecation warning for kv_role="kv_both" with
-        # NixlConnector. Dynamo 1.3.0 documents this exact P/D config.
+        disaggregation = dynamo_cfg.disaggregation
+        if disaggregation is None:
+            raise ValueError(
+                f"A {worker_role} Dynamo worker requires dynamo_cfg.disaggregation."
+            )
+        # kv_both is the role Dynamo 1.5 documents for NixlConnector P/D workers,
+        # and it is mandatory for prefill workers. A KV pull that fails, for example
+        # after a lease lapsed during an in-flight weight update, is recomputed on
+        # the decode engine instead of failing the rollout.
         builder.add(
             "--kv-transfer-config",
-            {"kv_connector": "NixlConnector", "kv_role": "kv_both"},
+            {
+                "kv_connector": "NixlConnector",
+                "kv_role": "kv_both",
+                "kv_load_failure_policy": "recompute",
+                "kv_connector_extra_config": {
+                    "kv_lease_duration": disaggregation.kv_lease_duration_s
+                },
+            },
             source="managed disaggregation",
         )
         if worker_role == "prefill":

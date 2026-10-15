@@ -541,6 +541,11 @@ def test_worker_registers_process_group_immediately_after_launch(
     monkeypatch.delenv("VLLM_USE_DEEP_GEMM", raising=False)
     config = _config()
     config["vllm_cfg"]["precision"] = precision
+    config["colocated"]["resources"] = {"gpus_per_node": 2, "num_nodes": 1}
+    config["dynamo_cfg"]["disaggregation"] = {
+        "prefill_workers": 1,
+        "decode_workers": 1,
+    }
 
     worker_cls(
         config,

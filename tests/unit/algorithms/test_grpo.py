@@ -3076,6 +3076,33 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node(
         setup(master_config, tokenizer, dataset, None)
 
 
+@pytest.mark.parametrize(
+    ("in_flight", "recompute", "disaggregation", "rejected"),
+    [
+        (True, True, {"prefill_workers": 1, "decode_workers": 1}, True),
+        (True, False, {"prefill_workers": 1, "decode_workers": 1}, False),
+        (False, True, {"prefill_workers": 1, "decode_workers": 1}, False),
+        (True, True, None, False),
+        (True, False, None, False),
+    ],
+)
+def test_dynamo_in_flight_refit_cannot_clear_the_cache_when_disaggregated(
+    in_flight, recompute, disaggregation, rejected
+):
+    from nemo_rl.models.generation.dynamo import DynamoGeneration
+
+    generation_config = {"dynamo_cfg": {"disaggregation": disaggregation}}
+    kwargs = {
+        "in_flight_weight_updates": in_flight,
+        "recompute_kv_cache_after_weight_updates": recompute,
+    }
+    if rejected:
+        with pytest.raises(ValueError, match="remote KV transfer"):
+            DynamoGeneration.validate_in_flight_refit(generation_config, **kwargs)
+    else:
+        DynamoGeneration.validate_in_flight_refit(generation_config, **kwargs)
+
+
 def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
     mock_grpo_components,
 ):
@@ -3134,20 +3161,9 @@ def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
         },
     }
 
+    # In-flight weight updates no longer fail setup on their own; this config is
+    # rejected only for its colocated inference.
     master_config.grpo.async_grpo.in_flight_weight_updates = True
-    with (
-        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
-        pytest.raises(ValueError, match="in_flight_weight_updates must be false"),
-    ):
-        setup(
-            master_config,
-            tokenizer=MagicMock(),
-            dataset=MagicMock(),
-            val_dataset=None,
-        )
-    mock_logger.assert_not_called()
-
-    master_config.grpo.async_grpo.in_flight_weight_updates = False
 
     with (
         patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,

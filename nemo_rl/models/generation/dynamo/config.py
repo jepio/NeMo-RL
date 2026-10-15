@@ -152,10 +152,21 @@ class DynamoFrontendArgs(BaseModel, extra="forbid"):
 
 
 class DynamoDisaggregationConfig(BaseModel, extra="forbid"):
-    """Managed prefill/decode worker counts for one shared engine shape."""
+    """Managed prefill/decode worker counts for one shared engine shape.
+
+    Attributes:
+        prefill_workers: Number of prefill-only engines.
+        decode_workers: Number of decode-only engines.
+        kv_lease_duration_s: Seconds a prefill engine holds a request's KV blocks
+            for a decode engine to pull. Decode engines renew it while they step,
+            but an in-flight weight update freezes them for the whole refit, so
+            keep it longer than the longest refit. Past it, the blocks are freed
+            and the decode engine recomputes the prefill locally.
+    """
 
     prefill_workers: PositiveInt
     decode_workers: PositiveInt
+    kv_lease_duration_s: PositiveInt = 600
 
 
 class DynamoCfg(BaseModel, extra="forbid"):

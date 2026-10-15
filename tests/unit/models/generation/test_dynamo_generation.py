@@ -459,6 +459,80 @@ def test_drain_for_weight_update_pauses_every_worker_and_resume_restores_them(
     ]
 
 
+@pytest.mark.parametrize("clear_cache", [True, False])
+def test_in_flight_refit_freezes_every_worker_and_resumes_them(
+    monkeypatch, clear_cache
+) -> None:
+    workers = [
+        {"instance_id": "a", "system_url": "http://10.0.0.2:4000"},
+        {"instance_id": "b", "system_url": "http://10.0.0.3:4000"},
+    ]
+    _patch_runtime(monkeypatch, workers=workers)
+    calls = []
+    monkeypatch.setattr(
+        refit_module._post_worker_route,
+        "remote",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+    monkeypatch.setattr(refit_module.ray, "get", lambda refs: refs)
+
+    # The async collector drives the pause from its own pickled client copy.
+    generation = pickle.loads(
+        pickle.dumps(DynamoGeneration(cluster=object(), config=_config()))
+    )
+    assert generation.pause_generation_for_refit(clear_cache=clear_cache) is True
+    assert [(call["route"], call["system_url"], call["payload"]) for call in calls] == [
+        (
+            "pause_generation",
+            url,
+            {"mode": "keep", "clear_cache": clear_cache},
+        )
+        for url in ("http://10.0.0.2:4000", "http://10.0.0.3:4000")
+    ]
+    assert all(call["timeout_s"] == 10 for call in calls)
+
+    calls.clear()
+    assert generation.resume_generation_after_refit() is True
+    assert [(call["route"], call["system_url"]) for call in calls] == [
+        ("resume_generation", "http://10.0.0.2:4000"),
+        ("resume_generation", "http://10.0.0.3:4000"),
+    ]
+
+
+def test_failed_in_flight_pause_resumes_the_workers_that_paused(monkeypatch) -> None:
+    calls = []
+
+    def remote(**kwargs):
+        calls.append(kwargs)
+        return (kwargs["route"], kwargs["system_url"])
+
+    def get(ref):
+        if ref == ("pause_generation", "http://worker-b:4000"):
+            raise RuntimeError("pause refused")
+        return True
+
+    monkeypatch.setattr(refit_module._post_worker_route, "remote", remote)
+    monkeypatch.setattr(refit_module.ray, "get", get)
+    _patch_runtime(
+        monkeypatch,
+        workers=[
+            {"instance_id": "a", "system_url": "http://worker-a:4000"},
+            {"instance_id": "b", "system_url": "http://worker-b:4000"},
+        ],
+    )
+    generation = DynamoGeneration(cluster=object(), config=_config())
+
+    with pytest.raises(RuntimeError, match="pause \\(mode=keep\\) failed"):
+        generation.pause_generation_for_refit(clear_cache=False)
+
+    # Nothing may stay frozen when the refit never starts.
+    assert [(call["route"], call["system_url"]) for call in calls] == [
+        ("pause_generation", "http://worker-a:4000"),
+        ("pause_generation", "http://worker-b:4000"),
+        ("resume_generation", "http://worker-a:4000"),
+    ]
+
+
 def test_failed_pause_resumes_the_workers_that_paused(monkeypatch) -> None:
     calls = []
 
@@ -483,7 +557,7 @@ def test_failed_pause_resumes_the_workers_that_paused(monkeypatch) -> None:
     )
 
     with pytest.raises(RuntimeError, match="pause before weight update failed"):
-        channel.pause()
+        channel.pause(mode="wait", clear_cache=True)
 
     assert [(call["route"], call["system_url"]) for call in calls] == [
         ("pause_generation", "http://worker-a:4000"),

@@ -404,7 +404,13 @@ def test_worker_argv_translates_structured_fields_and_warns_unclassified() -> No
 
 
 def test_disaggregated_worker_argv_owns_role_and_nixl_configuration() -> None:
-    cfg = DynamoCfg.model_validate(_dynamo_cfg())
+    dynamo_cfg = _dynamo_cfg()
+    dynamo_cfg["disaggregation"] = {
+        "prefill_workers": 1,
+        "decode_workers": 1,
+        "kv_lease_duration_s": 900,
+    }
+    cfg = DynamoCfg.model_validate(dynamo_cfg)
     common = {
         "model_name": "model",
         "namespace": "nemo-rl-1",
@@ -424,18 +430,51 @@ def test_disaggregated_worker_argv_owns_role_and_nixl_configuration() -> None:
         kv_event_port=4201,
     )
 
-    nixl_config = '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+    nixl_config = {
+        "kv_connector": "NixlConnector",
+        "kv_role": "kv_both",
+        # A lapsed lease or failed pull must recompute, not fail the rollout.
+        "kv_load_failure_policy": "recompute",
+        "kv_connector_extra_config": {"kv_lease_duration": 900},
+    }
     assert _flag_value(decode_argv, "--disaggregation-mode") == "decode"
-    assert _flag_value(decode_argv, "--kv-transfer-config") == nixl_config
+    assert json.loads(_flag_value(decode_argv, "--kv-transfer-config")) == nixl_config
     assert "--kv-events-config" not in decode_argv
     assert _flag_value(prefill_argv, "--disaggregation-mode") == "prefill"
-    assert _flag_value(prefill_argv, "--kv-transfer-config") == nixl_config
+    assert json.loads(_flag_value(prefill_argv, "--kv-transfer-config")) == nixl_config
     assert json.loads(_flag_value(prefill_argv, "--kv-events-config")) == {
         "enable_kv_cache_events": True,
         "endpoint": "tcp://*:4201",
         "publisher": "zmq",
         "topic": "kv-events",
     }
+
+
+def test_disaggregated_kv_lease_defaults_to_outlast_a_refit() -> None:
+    assert (
+        DynamoCfg.model_validate(
+            {
+                **_dynamo_cfg(),
+                "disaggregation": {"prefill_workers": 1, "decode_workers": 2},
+            }
+        ).disaggregation.kv_lease_duration_s
+        == 600
+    )
+
+
+@pytest.mark.parametrize("role", ["decode", "prefill"])
+def test_disaggregated_role_requires_disaggregation_config(role) -> None:
+    with pytest.raises(ValueError, match="requires dynamo_cfg.disaggregation"):
+        build_dynamo_vllm_argv(
+            model_name="model",
+            namespace="namespace",
+            seed=0,
+            vllm_cfg=_config()["vllm_cfg"],
+            vllm_kwargs={},
+            dynamo_cfg=DynamoCfg.model_validate(_dynamo_cfg()),
+            worker_role=role,
+            kv_event_port=4201 if role == "prefill" else None,
+        )
 
 
 def test_worker_argv_rejects_replaced_and_managed_options() -> None:

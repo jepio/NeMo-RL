@@ -648,16 +648,17 @@ def setup(
     elif generation_config["backend"] == "dynamo":
         # Validate the complete managed-Dynamo boundary before allocating Ray
         # placement groups or starting any external services.
-        if grpo_config.async_grpo.in_flight_weight_updates:
-            raise ValueError(
-                "grpo.async_grpo.in_flight_weight_updates must be false when "
-                "policy.generation.backend='dynamo'; managed Dynamo drains "
-                "rollouts before layerwise weight refit"
-            )
         generation_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
             policy_config.get("hf_config_overrides") or {}
         )
         generation_config = DynamoConfig.model_validate(generation_config).model_dump()
+        DynamoGeneration.validate_in_flight_refit(
+            generation_config,
+            in_flight_weight_updates=grpo_config.async_grpo.in_flight_weight_updates,
+            recompute_kv_cache_after_weight_updates=(
+                grpo_config.async_grpo.recompute_kv_cache_after_weight_updates
+            ),
+        )
         policy_config["generation"] = generation_config
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
