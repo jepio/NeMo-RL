@@ -15,9 +15,10 @@ policy:
       disaggregation:
         prefill_workers: 1
         decode_workers: 1
-        # Seconds a prefill engine holds KV for a decode engine to pull. Keep it
-        # longer than the longest refit: in-flight updates freeze both engines.
-        kv_lease_duration_s: 600
+        # Seconds a prefill engine holds KV for a decode engine to pull. A refit
+        # pauses prefill first and waits for pending pulls, so this bounds that
+        # wait. Keep it shorter than control_timeout_s.
+        kv_lease_duration_s: 120
     colocated:
       resources:
         gpus_per_node: 2

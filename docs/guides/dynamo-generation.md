@@ -163,7 +163,7 @@ policy:
       disaggregation:
         prefill_workers: 1
         decode_workers: 1
-        kv_lease_duration_s: 600
+        kv_lease_duration_s: 120
 ```
 
 Both roles use the same `vllm_cfg` and `vllm_kwargs`. The required inference
@@ -197,11 +197,11 @@ Two managed vLLM settings keep disaggregation robust across refits:
 
 - `kv_load_failure_policy: recompute`: when a decode engine cannot pull KV from
   prefill, it prefills locally instead of failing the rollout.
-- `kv_lease_duration_s`: how long a prefill engine holds a finished request's KV
-  for the decode engine. Decode engines renew it only while they step, and an
-  [in-flight weight update](#in-flight-weight-updates) freezes them for the whole
-  refit. Keep the lease longer than your longest refit; a lapsed lease costs a
-  local recompute, not a failure.
+- `kv_lease_duration_s` (default 120): how long a prefill engine holds a finished
+  request's KV for the decode engine. A refit pauses prefill engines first and
+  waits until the decode engines have pulled their pending KV, so no lease is open
+  when decode freezes. The lease only bounds that wait. Keep it shorter than
+  `dynamo_cfg.control_timeout_s`; setup rejects a longer value.
 
 ## In-flight weight updates
 
@@ -234,8 +234,11 @@ Operational notes:
 - Requests stay open while the fleet is paused, so `dynamo_cfg.request_timeout_s`
   must exceed the longest refit.
 - `dynamo_cfg.control_timeout_s` bounds each pause and resume call.
-- A pause that fails on any engine resumes the engines that did pause and
-  raises, so a failed refit never leaves the fleet frozen.
+- On a prefill/decode fleet, prefill engines pause first, always in `wait` mode,
+  and decode engines pause after they confirm. Resume goes decode first. See the
+  [design document](../design-docs/dynamo-integration.md#pausing-around-a-refit).
+- A pause that fails on any engine resumes every engine, including the one that
+  failed, and raises, so a failed refit never leaves the fleet frozen.
 - The SingleController does not use keep-mode pause; it still drains (see
   [Run under the SingleController](#run-under-the-singlecontroller)).
 

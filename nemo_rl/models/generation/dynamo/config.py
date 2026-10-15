@@ -158,15 +158,17 @@ class DynamoDisaggregationConfig(BaseModel, extra="forbid"):
         prefill_workers: Number of prefill-only engines.
         decode_workers: Number of decode-only engines.
         kv_lease_duration_s: Seconds a prefill engine holds a request's KV blocks
-            for a decode engine to pull. Decode engines renew it while they step,
-            but an in-flight weight update freezes them for the whole refit, so
-            keep it longer than the longest refit. Past it, the blocks are freed
-            and the decode engine recomputes the prefill locally.
+            for a decode engine to pull. Decode engines renew the lease while they
+            step. A weight update pauses prefill engines first and waits until
+            decode has pulled their pending KV, so this is also the longest that
+            the prefill pause can wait. Keep it shorter than
+            ``dynamo_cfg.control_timeout_s``. A lease that ends before the pull
+            frees the blocks, and the decode engine then prefills locally.
     """
 
     prefill_workers: PositiveInt
     decode_workers: PositiveInt
-    kv_lease_duration_s: PositiveInt = 600
+    kv_lease_duration_s: PositiveInt = 120
 
 
 class DynamoCfg(BaseModel, extra="forbid"):
@@ -181,6 +183,22 @@ class DynamoCfg(BaseModel, extra="forbid"):
     frontend_args: DynamoFrontendArgs
     metrics_include_prefixes: list[str] | None
     metrics_exclude_prefixes: list[str] | None
+
+    @model_validator(mode="after")
+    def _validate_kv_lease_fits_control_timeout(self) -> "DynamoCfg":
+        disaggregation = self.disaggregation
+        if (
+            disaggregation is not None
+            and disaggregation.kv_lease_duration_s >= self.control_timeout_s
+        ):
+            raise ValueError(
+                "dynamo_cfg.disaggregation.kv_lease_duration_s "
+                f"({disaggregation.kv_lease_duration_s}) must be less than "
+                f"control_timeout_s ({self.control_timeout_s}): a prefill pause can "
+                "wait one lease for pending KV, and the pause call would time out "
+                "first."
+            )
+        return self
 
 
 class DynamoVllmConfig(BaseModel, extra="allow"):

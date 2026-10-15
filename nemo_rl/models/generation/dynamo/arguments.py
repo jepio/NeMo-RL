@@ -165,9 +165,8 @@ def build_dynamo_vllm_argv(
                 f"A {worker_role} Dynamo worker requires dynamo_cfg.disaggregation."
             )
         # kv_both is the role Dynamo 1.5 documents for NixlConnector P/D workers,
-        # and it is mandatory for prefill workers. A KV pull that fails, for example
-        # after a lease lapsed during an in-flight weight update, is recomputed on
-        # the decode engine instead of failing the rollout.
+        # and it is mandatory for prefill workers. A KV pull that fails is
+        # recomputed on the decode engine instead of failing the rollout.
         builder.add(
             "--kv-transfer-config",
             {

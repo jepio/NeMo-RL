@@ -408,7 +408,7 @@ def test_disaggregated_worker_argv_owns_role_and_nixl_configuration() -> None:
     dynamo_cfg["disaggregation"] = {
         "prefill_workers": 1,
         "decode_workers": 1,
-        "kv_lease_duration_s": 900,
+        "kv_lease_duration_s": 100,
     }
     cfg = DynamoCfg.model_validate(dynamo_cfg)
     common = {
@@ -435,7 +435,7 @@ def test_disaggregated_worker_argv_owns_role_and_nixl_configuration() -> None:
         "kv_role": "kv_both",
         # A lapsed lease or failed pull must recompute, not fail the rollout.
         "kv_load_failure_policy": "recompute",
-        "kv_connector_extra_config": {"kv_lease_duration": 900},
+        "kv_connector_extra_config": {"kv_lease_duration": 100},
     }
     assert _flag_value(decode_argv, "--disaggregation-mode") == "decode"
     assert json.loads(_flag_value(decode_argv, "--kv-transfer-config")) == nixl_config
@@ -450,16 +450,38 @@ def test_disaggregated_worker_argv_owns_role_and_nixl_configuration() -> None:
     }
 
 
-def test_disaggregated_kv_lease_defaults_to_outlast_a_refit() -> None:
-    assert (
+def test_disaggregated_kv_lease_defaults_below_the_control_timeout() -> None:
+    cfg = DynamoCfg.model_validate(
+        {
+            **_dynamo_cfg(),
+            "disaggregation": {"prefill_workers": 1, "decode_workers": 2},
+        }
+    )
+    assert cfg.disaggregation.kv_lease_duration_s == 120
+    assert cfg.disaggregation.kv_lease_duration_s < cfg.control_timeout_s
+
+
+@pytest.mark.parametrize("lease_s", [600, 601])
+def test_disaggregated_kv_lease_must_be_shorter_than_the_control_timeout(
+    lease_s,
+) -> None:
+    # A prefill pause can wait one lease for pending KV; the pause call would time
+    # out first.
+    with pytest.raises(ValueError, match="must be less than control_timeout_s"):
         DynamoCfg.model_validate(
             {
                 **_dynamo_cfg(),
-                "disaggregation": {"prefill_workers": 1, "decode_workers": 2},
+                "disaggregation": {
+                    "prefill_workers": 1,
+                    "decode_workers": 1,
+                    "kv_lease_duration_s": lease_s,
+                },
             }
-        ).disaggregation.kv_lease_duration_s
-        == 600
-    )
+        )
+
+
+def test_kv_lease_is_not_checked_without_disaggregation() -> None:
+    DynamoCfg.model_validate({**_dynamo_cfg(), "control_timeout_s": 1})
 
 
 @pytest.mark.parametrize("role", ["decode", "prefill"])

@@ -31,9 +31,11 @@ NIXL UCX/RDMA path and is not qualified when it falls back to TCP.
 The connector also sets two vLLM options that matter across weight updates.
 `kv_load_failure_policy: recompute` turns a failed KV pull into a local prefill.
 `kv_lease_duration` (`dynamo_cfg.disaggregation.kv_lease_duration_s`) is how long
-a prefill engine keeps a finished request's KV for the decode engine. Leases are
-renewed by the decode scheduler's heartbeats, which stop while an engine is
-paused, so the lease must outlast the longest refit.
+a prefill engine keeps a finished request's KV for the decode engine. The decode
+scheduler renews it with heartbeats, and only while it steps. A refit pauses
+prefill first (see below), so no lease is open while decode is frozen. The lease
+then bounds only how long the prefill pause can wait, and it must stay below
+`control_timeout_s`.
 
 Startup completes only after the frontend sees the same fixed membership at
 the generation and RL endpoints for both the `backend` and `prefill`
@@ -113,10 +115,24 @@ prefill and decode alike, through Dynamo's `pause_generation` route, which hands
   invalidation): running requests finish on the old weights, new ones queue, and
   caches are cleared once idle.
 
-A pause that fails on any engine resumes the engines that did pause before it
-raises, so a failed refit never leaves part of the fleet frozen. With
-`in_flight_weight_updates` off, the async collector drains its own trajectories
-instead and refits an idle fleet.
+On a prefill/decode fleet the order matters. A prefill engine keeps the KV of a
+finished request until a decode engine pulls it, and a paused decode engine pulls
+nothing, so pausing both at once stalls the prefill pause until the lease ends.
+The channel therefore pauses prefill engines first and waits for them while decode
+still steps and pulls the pending KV. Only then does it pause decode. Prefill
+always uses `wait`: in `keep` a chunked prefill would freeze in the middle of a
+prompt and finish on the new weights, so one prompt would carry KV from two
+weight versions. Resume goes the other way, decode first, so that prefill does
+not produce KV that nobody can pull. A fleet without prefill engines pauses all
+engines at once.
+
+If a pause fails on any engine, the channel resumes every engine before it
+raises, including the engine that failed, because a pause call that timed out can
+still finish later. Dynamo runs pause and resume under one lock, so the resume
+lands after that late pause. The rollback waits for twice the control timeout for
+the same reason. A failed refit therefore never leaves part of the fleet frozen.
+With `in_flight_weight_updates` off, the async collector drains its own
+trajectories instead and refits an idle fleet.
 
 ## Dependencies
 

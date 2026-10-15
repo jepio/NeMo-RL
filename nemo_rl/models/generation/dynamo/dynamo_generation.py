@@ -844,6 +844,10 @@ class DynamoGeneration(GenerationInterface):
         and keeps its requests; they continue on the new weights after
         :meth:`resume_generation_after_refit`. New requests queue until then.
 
+        On a prefill/decode fleet, prefill engines pause first and finish their
+        running prefills on the old weights, and decode engines pause after that.
+        See :meth:`DynamoRefitChannel.pause`.
+
         Args:
             clear_cache: Clear each engine's KV and prefix caches while paused, so
                 kept requests recompute their KV on the new weights.
@@ -852,7 +856,7 @@ class DynamoGeneration(GenerationInterface):
             True once every engine has paused.
 
         Raises:
-            RuntimeError: If any engine fails to pause; engines that did are resumed.
+            RuntimeError: If any engine fails to pause; every engine is resumed.
         """
         self._require_refit_channel().pause(mode="keep", clear_cache=clear_cache)
         return True
