@@ -3103,14 +3103,11 @@ def test_dynamo_in_flight_refit_cannot_clear_the_cache_when_disaggregated(
         DynamoGeneration.validate_in_flight_refit(generation_config, **kwargs)
 
 
-def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
-    mock_grpo_components,
-):
-    from nemo_rl.algorithms.grpo import setup
-
-    master_config = mock_grpo_components["master_config"]
-    master_config.policy["hf_config_overrides"] = {"rope_theta": 1_000_000.0}
-    master_config.policy["generation"] = {
+def _dynamo_generation_config(
+    *, colocated: dict, disaggregation: dict | None = None
+) -> dict:
+    """A minimal ``policy.generation`` block for the managed Dynamo backend."""
+    config = {
         "backend": "dynamo",
         "dynamo_cfg": {
             "engine": "vllm",
@@ -3155,11 +3152,25 @@ def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
             "env_vars": {},
         },
         "vllm_kwargs": {},
-        "colocated": {
+        "colocated": colocated,
+    }
+    config["dynamo_cfg"]["disaggregation"] = disaggregation
+    return config
+
+
+def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
+    mock_grpo_components,
+):
+    from nemo_rl.algorithms.grpo import setup
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["hf_config_overrides"] = {"rope_theta": 1_000_000.0}
+    master_config.policy["generation"] = _dynamo_generation_config(
+        colocated={
             "enabled": True,
             "resources": {"gpus_per_node": None, "num_nodes": None},
-        },
-    }
+        }
+    )
 
     # In-flight weight updates no longer fail setup on their own; this config is
     # rejected only for its colocated inference.
@@ -3195,6 +3206,41 @@ def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
             val_dataset=None,
         )
     assert master_config.policy["generation"]["vllm_kwargs"]["hf_overrides"] == {}
+
+
+def test_setup_rejects_in_flight_cache_clearing_on_a_disaggregated_fleet(
+    mock_grpo_components,
+):
+    """Setup, not only the static check, must stop this config before any side effect."""
+    from nemo_rl.algorithms.grpo import setup
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"] = _dynamo_generation_config(
+        colocated={
+            "enabled": False,
+            "resources": {"gpus_per_node": 2, "num_nodes": 1},
+        },
+        disaggregation={
+            "prefill_workers": 1,
+            "decode_workers": 1,
+            "kv_lease_duration_s": 10,
+        },
+    )
+    master_config.grpo.async_grpo.in_flight_weight_updates = True
+    master_config.grpo.async_grpo.recompute_kv_cache_after_weight_updates = True
+
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
+        pytest.raises(ValueError, match="remote KV transfer"),
+    ):
+        setup(
+            master_config,
+            tokenizer=MagicMock(),
+            dataset=MagicMock(),
+            val_dataset=None,
+        )
+
+    mock_logger.assert_not_called()
 
 
 def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> None:
