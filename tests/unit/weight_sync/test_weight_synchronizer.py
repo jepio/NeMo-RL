@@ -24,7 +24,7 @@ from nemo_rl.models.generation.constants import (
     SGLANG_BACKEND,
     VLLM_BACKEND,
 )
-from nemo_rl.models.generation.interfaces import CollectiveSenderSpec
+from nemo_rl.models.generation.interfaces import RefitFleetShape
 from nemo_rl.weight_sync.collective_weight_synchronizer import (
     CollectiveWeightSynchronizer,
 )
@@ -89,7 +89,9 @@ def _mock_generation(**overrides):
     # fail there, on a comparison, several frames from the cause.
     gen.worker_group.dp_size = 2
     gen.worker_group.workers = [MagicMock(), MagicMock()]
-    gen.get_collective_sender_spec.return_value = CollectiveSenderSpec()
+    gen.get_refit_fleet_shape.return_value = RefitFleetShape(
+        dp_size=2, total_gen_workers=2
+    )
     gen.get_inference_world_size.return_value = None
     gen.get_refit_payload_mode.return_value = "hf_export"
     for k, v in overrides.items():
@@ -647,9 +649,6 @@ class TestCollectiveWeightSynchronizer:
         policy.offload_before_refit.side_effect = lambda: events.append(
             "offload_before_refit"
         )
-        gen.get_collective_sender_spec.side_effect = lambda: (
-            events.append("get_collective_sender_spec") or CollectiveSenderSpec()
-        )
         policy.broadcast_weights_for_collective.side_effect = lambda **_: (
             events.append("broadcast_weights_for_collective") or [MagicMock()]
         )
@@ -666,10 +665,8 @@ class TestCollectiveWeightSynchronizer:
 
         assert events == [
             "offload_before_refit",
-            "get_collective_sender_spec",
             "broadcast_weights_for_collective",
             "offload_before_refit",
-            "get_collective_sender_spec",
             "broadcast_weights_for_collective",
         ]
 
@@ -708,8 +705,6 @@ class TestCollectiveWeightSynchronizer:
         policy.broadcast_weights_for_collective.assert_called_once_with(
             kv_scales=None,
             refit_timeout_s=None,
-            buffer_size_bytes=None,
-            num_buffers=None,
         )
         gen.update_weights_from_collective.assert_called_once()
 
@@ -760,22 +755,17 @@ class TestCollectiveWeightSynchronizer:
         )
         gen.prepare_refit_info.assert_called_once()
         policy.init_collective.assert_called_once_with(
-            "10.0.0.1", 29500, 6, train_world_size=4, nccl_peer="nemo"
+            "10.0.0.1", 29500, 6, train_world_size=4
         )
         gen.init_collective.assert_called_once_with(
             "10.0.0.1", 29500, 6, train_world_size=4
         )
 
     @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
-    def test_backend_sender_contract_controls_geometry_and_world_size(self, mock_ray):
+    def test_backend_world_size_overrides_the_inference_cluster(self, mock_ray):
         mock_ray.get.return_value = [True]
         policy = _mock_policy()
         gen = _mock_generation()
-        gen.get_collective_sender_spec.return_value = CollectiveSenderSpec(
-            nccl_peer="vllm",
-            buffer_size_bytes=1024**3,
-            num_buffers=2,
-        )
         gen.get_inference_world_size.return_value = 8
         sync = CollectiveWeightSynchronizer(
             policy,
@@ -785,19 +775,12 @@ class TestCollectiveWeightSynchronizer:
         )
 
         sync.init_communicator()
-        sync.sync_weights()
 
         policy.init_collective.assert_called_once_with(
-            "10.0.0.1", 29500, 12, train_world_size=4, nccl_peer="vllm"
+            "10.0.0.1", 29500, 12, train_world_size=4
         )
         gen.init_collective.assert_called_once_with(
             "10.0.0.1", 29500, 12, train_world_size=4
-        )
-        policy.broadcast_weights_for_collective.assert_called_once_with(
-            kv_scales=None,
-            refit_timeout_s=None,
-            buffer_size_bytes=1024**3,
-            num_buffers=2,
         )
 
 
@@ -861,8 +844,9 @@ class TestNcclReshardWeightSynchronizer:
         gen = _mock_generation(cfg={"backend": "vllm"})
         gen.init_nccl_reshard_comm_group.return_value = [MagicMock()]
         # tp_size=4 over a 4-GPU generation world -> one DP shard.
-        gen.worker_group.dp_size = 1
-        gen.worker_group.workers = [MagicMock() for _ in range(4)]
+        gen.get_refit_fleet_shape.return_value = RefitFleetShape(
+            dp_size=1, total_gen_workers=4
+        )
         train_cluster = _mock_cluster(world_size=2)
         train_cluster.num_gpus_per_node = 8
         train_cluster.get_available_address_and_port.return_value = (
@@ -1202,6 +1186,7 @@ class TestFactory:
             (True, True, VLLM_BACKEND, False, "http"),
             (True, True, SGLANG_BACKEND, False, None),
             (True, False, VLLM_BACKEND, False, None),
+            (True, True, DYNAMO_BACKEND, False, "mcore"),
         ],
     )
     def test_refit_memory_release_config_rejects_unsupported_setup(
@@ -1215,6 +1200,16 @@ class TestFactory:
                 colocated=colocated,
                 refit_transport=transport,
             )
+
+    @pytest.mark.parametrize("transport", [None, "nccl_reshard"])
+    def test_refit_memory_release_config_accepts_dynamo(self, transport):
+        validate_offload_policy_before_refit(
+            enabled=True,
+            megatron_enabled=True,
+            generation_backend=DYNAMO_BACKEND,
+            colocated=False,
+            refit_transport=transport,
+        )
 
     def test_colocated_vllm_returns_ipc(self):
         policy = _mock_policy()

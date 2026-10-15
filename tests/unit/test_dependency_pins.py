@@ -144,3 +144,36 @@ def test_torch_split_shims_are_still_needed() -> None:
         "(nemo_rl/data_plane/adapters/tq_mooncake_checkpoint.py) - drop the "
         "check outright; the pre-2.13 `names` comparison cannot be restored"
     )
+
+
+def test_dynamo_extra_is_the_vllm_extra_plus_dynamo() -> None:
+    """dynamo.vllm workers load NeMo RL's vLLM worker extension, so the dynamo extra
+    must carry every vllm-extra requirement unchanged, plus only the Dynamo runtime."""
+    extras = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"][
+        "optional-dependencies"
+    ]
+    vllm = {str(Requirement(dep)) for dep in extras["vllm"]}
+    dynamo = {str(Requirement(dep)) for dep in extras["dynamo"]}
+
+    assert vllm <= dynamo, f"dynamo extra is missing {sorted(vllm - dynamo)}"
+    assert {canonicalize_name(Requirement(dep).name) for dep in dynamo - vllm} == {
+        "ai-dynamo",
+        "ai-dynamo-runtime",
+        "uvloop",
+        "blake3",
+    }
+
+
+def test_dynamo_planner_tooling_stays_out_of_the_lock() -> None:
+    """ai-dynamo hard-requires aisimulate (JAX, flax, optax) and kubernetes, but only
+    Dynamo's planner, profiler and replay tooling import them. The managed
+    dynamo.vllm and dynamo.frontend processes do not, so the overrides keep them out
+    of the lock. Drop an override only if a Dynamo upgrade imports it when serving."""
+    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    overrides = {
+        canonicalize_name(Requirement(dep).name): Requirement(dep)
+        for dep in project["tool"]["uv"]["override-dependencies"]
+    }
+    for name in ("aisimulate", "kubernetes"):
+        assert name in overrides, f"{name} must stay overridden out of the lock"
+        assert str(overrides[name].marker) == 'sys_platform == "never"'
