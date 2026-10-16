@@ -498,21 +498,20 @@ class DynamoRefitChannel:
 
         Args:
             mode: How workers treat requests they are running.
-            clear_cache: Clear each engine's KV and prefix caches once paused, so
-                kept requests recompute their KV after the update. Not allowed on
-                a prefill/decode fleet.
+            clear_cache: Clear each engine's KV and prefix caches once paused. The
+                running requests are preempted, so they recompute their KV on the
+                new weights, and no new request hits the prefix cache of the old
+                weights. On a prefill/decode fleet this needs
+                ``_patch_vllm_reset_cache_with_held_kv``: the KV that a prefill
+                engine holds for decode, and the blocks of a decode request that
+                waits for remote KV, stay in use. They only stop being cacheable. A
+                request that is between prefill and decode keeps its old KV.
 
         Raises:
-            ValueError: If ``clear_cache`` is set on a prefill/decode fleet, or
-                ``mode="wait"`` is used there. No request is sent in these cases.
+            ValueError: If ``mode="wait"`` is used on a prefill/decode fleet. No
+                request is sent in this case.
             RuntimeError: If any engine fails to pause.
         """
-        if self.is_disaggregated and clear_cache:
-            raise ValueError(
-                "A prefill/decode fleet cannot clear its caches while it pauses: "
-                "the prefill engines still hold KV for the decode engines, and "
-                "vLLM raises when a cache clear cannot free it."
-            )
         if self.is_disaggregated and mode == "wait":
             raise ValueError(
                 "A prefill/decode fleet cannot pause in 'wait' mode: a decode "
@@ -574,14 +573,15 @@ class DynamoRefitChannel:
             )
 
     def flush_cache(self) -> bool:
-        """Drain, clear, and resume every worker using immutable endpoints.
+        """Pause, clear the caches, and resume every worker.
 
-        Use this only when no request is in flight, for example after the async
-        collector has drained every trajectory. On a prefill/decode fleet with
-        requests in flight, a ``wait`` pause stalls on a prefill engine's held KV
-        and the cache clear can raise.
+        Use this after the async collector has drained every trajectory. An
+        aggregated fleet drains in ``wait`` mode. A prefill/decode fleet pauses in
+        ``keep`` mode: a ``wait`` pause stalls on the KV that a prefill engine
+        still holds for a request whose handoff was lost, until its lease ends.
         """
-        _, pause_errors = self._pause_workers(mode="wait", clear_cache=True)
+        mode: PauseMode = "keep" if self.is_disaggregated else "wait"
+        _, pause_errors = self._pause_workers(mode=mode, clear_cache=True)
         if pause_errors:
             resume_errors = self._roll_back_pause()
         else:

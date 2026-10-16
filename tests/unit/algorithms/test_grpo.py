@@ -3076,36 +3076,7 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node(
         setup(master_config, tokenizer, dataset, None)
 
 
-@pytest.mark.parametrize(
-    ("in_flight", "recompute", "disaggregation", "rejected"),
-    [
-        (True, True, {"prefill_workers": 1, "decode_workers": 1}, True),
-        (True, False, {"prefill_workers": 1, "decode_workers": 1}, False),
-        (False, True, {"prefill_workers": 1, "decode_workers": 1}, False),
-        (True, True, None, False),
-        (True, False, None, False),
-    ],
-)
-def test_dynamo_in_flight_refit_cannot_clear_the_cache_when_disaggregated(
-    in_flight, recompute, disaggregation, rejected
-):
-    from nemo_rl.models.generation.dynamo import DynamoGeneration
-
-    generation_config = {"dynamo_cfg": {"disaggregation": disaggregation}}
-    kwargs = {
-        "in_flight_weight_updates": in_flight,
-        "recompute_kv_cache_after_weight_updates": recompute,
-    }
-    if rejected:
-        with pytest.raises(ValueError, match="remote KV transfer"):
-            DynamoGeneration.validate_in_flight_refit(generation_config, **kwargs)
-    else:
-        DynamoGeneration.validate_in_flight_refit(generation_config, **kwargs)
-
-
-def _dynamo_generation_config(
-    *, colocated: dict, disaggregation: dict | None = None
-) -> dict:
+def _dynamo_generation_config(*, colocated: dict) -> dict:
     """A minimal ``policy.generation`` block for the managed Dynamo backend."""
     config = {
         "backend": "dynamo",
@@ -3154,7 +3125,6 @@ def _dynamo_generation_config(
         "vllm_kwargs": {},
         "colocated": colocated,
     }
-    config["dynamo_cfg"]["disaggregation"] = disaggregation
     return config
 
 
@@ -3206,37 +3176,6 @@ def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
             val_dataset=None,
         )
     assert master_config.policy["generation"]["vllm_kwargs"]["hf_overrides"] == {}
-
-
-def test_setup_rejects_in_flight_cache_clearing_on_a_disaggregated_fleet(
-    mock_grpo_components,
-):
-    """Setup, not only the static check, must stop this config before any side effect."""
-    from nemo_rl.algorithms.grpo import setup
-
-    master_config = mock_grpo_components["master_config"]
-    master_config.policy["generation"] = _dynamo_generation_config(
-        colocated={
-            "enabled": False,
-            "resources": {"gpus_per_node": 2, "num_nodes": 1},
-        },
-        disaggregation={"prefill_workers": 1, "decode_workers": 1},
-    )
-    master_config.grpo.async_grpo.in_flight_weight_updates = True
-    master_config.grpo.async_grpo.recompute_kv_cache_after_weight_updates = True
-
-    with (
-        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
-        pytest.raises(ValueError, match="remote KV transfer"),
-    ):
-        setup(
-            master_config,
-            tokenizer=MagicMock(),
-            dataset=MagicMock(),
-            val_dataset=None,
-        )
-
-    mock_logger.assert_not_called()
 
 
 def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> None:

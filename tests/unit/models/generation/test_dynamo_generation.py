@@ -730,21 +730,28 @@ def test_pd_pause_sends_keep_to_every_engine_before_reading_any_result(
     ]
 
 
-@pytest.mark.parametrize(
-    ("mode", "clear_cache", "match"),
-    [
-        ("keep", True, "cannot clear its caches"),
-        ("wait", True, "cannot clear its caches"),
-        ("wait", False, "cannot pause in 'wait' mode"),
-    ],
-)
-def test_pd_pause_rejects_unsafe_modes_before_any_request(
-    monkeypatch, mode, clear_cache, match
+@pytest.mark.parametrize("clear_cache", [True, False])
+def test_pd_pause_may_clear_the_caches_in_keep_mode(monkeypatch, clear_cache) -> None:
+    channel, events = _prefill_decode_channel(monkeypatch)
+
+    channel.pause(mode="keep", clear_cache=clear_cache)
+
+    # With the patched vLLM, a keep pause that clears the caches works while prefill
+    # holds KV for decode: the running requests are preempted and recompute.
+    payloads = [event[3] for event in events if event[0] == "post"]
+    assert payloads == [{"mode": "keep", "clear_cache": clear_cache}] * 2
+
+
+@pytest.mark.parametrize("clear_cache", [True, False])
+def test_pd_pause_rejects_wait_mode_before_any_request(
+    monkeypatch, clear_cache
 ) -> None:
     channel, events = _prefill_decode_channel(monkeypatch)
 
-    with pytest.raises(ValueError, match=match):
-        channel.pause(mode=mode, clear_cache=clear_cache)
+    # A decode engine in the wait state admits no request that waits for remote KV,
+    # so the pause of a prefill engine waits for the KV lease.
+    with pytest.raises(ValueError, match="cannot pause in 'wait' mode"):
+        channel.pause(mode="wait", clear_cache=clear_cache)
 
     assert events == []
 
@@ -809,28 +816,41 @@ def test_failed_pd_pause_resumes_both_roles_decode_first(
     assert resume_timeouts == {20}
 
 
-def test_flush_cache_is_for_an_idle_fleet_and_resumes_decode_first(
+def test_pd_flush_cache_pauses_in_keep_mode_and_resumes_decode_first(
     monkeypatch,
 ) -> None:
     channel, events = _prefill_decode_channel(monkeypatch)
 
     assert channel.flush_cache() is True
 
+    # A wait pause would stall on KV that prefill holds for a lost handoff.
     posts = [(event[1], event[2], event[3]) for event in events if event[0] == "post"]
+    keep_clear = {"mode": "keep", "clear_cache": True}
     assert posts == [
-        (
-            "pause_generation",
-            "http://decode:4000",
-            {"mode": "wait", "clear_cache": True},
-        ),
-        (
-            "pause_generation",
-            "http://prefill:4000",
-            {"mode": "wait", "clear_cache": True},
-        ),
+        ("pause_generation", "http://decode:4000", keep_clear),
+        ("pause_generation", "http://prefill:4000", keep_clear),
         ("resume_generation", "http://decode:4000", {}),
         ("resume_generation", "http://prefill:4000", {}),
     ]
+
+
+def test_aggregated_flush_cache_still_drains_in_wait_mode(monkeypatch) -> None:
+    payloads = []
+    monkeypatch.setattr(
+        refit_module._post_worker_route,
+        "remote",
+        lambda **kwargs: payloads.append(kwargs["payload"]) or kwargs["system_url"],
+    )
+    monkeypatch.setattr(refit_module.ray, "get", lambda ref: True)
+    channel = DynamoRefitChannel(
+        [{"instance_id": "a", "system_url": "http://a:4000", "role": "aggregated"}],
+        engine_world_size=1,
+        control_timeout_s=10,
+    )
+
+    assert channel.flush_cache() is True
+
+    assert payloads[0] == {"mode": "wait", "clear_cache": True}
 
 
 def test_aggregated_fleet_still_pauses_all_engines_at_once(monkeypatch) -> None:

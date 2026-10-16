@@ -239,44 +239,6 @@ class DynamoGeneration(GenerationInterface):
                     "requests, and Gym talks to one token wrapper."
                 )
 
-    @staticmethod
-    def validate_in_flight_refit(
-        generation_config: dict[str, Any],
-        *,
-        in_flight_weight_updates: bool,
-        recompute_kv_cache_after_weight_updates: bool,
-    ) -> None:
-        """Reject in-flight refit settings the managed fleet cannot honor.
-
-        In-flight updates freeze requests with vLLM's keep-mode pause. Clearing the
-        cache at that pause preempts the engine's running requests, and vLLM cannot
-        do that for a decode request that is waiting on remote KV from a prefill
-        worker, so it raises. Without the clear, a paused disaggregated fleet is fine.
-
-        Args:
-            generation_config: ``policy.generation``, already normalized through
-                :class:`DynamoConfig`.
-            in_flight_weight_updates: ``grpo.async_grpo.in_flight_weight_updates``.
-            recompute_kv_cache_after_weight_updates:
-                ``grpo.async_grpo.recompute_kv_cache_after_weight_updates``.
-
-        Raises:
-            ValueError: On in-flight updates that clear the KV cache over a
-                prefill/decode-disaggregated fleet.
-        """
-        disaggregated = generation_config["dynamo_cfg"]["disaggregation"] is not None
-        if (
-            in_flight_weight_updates
-            and recompute_kv_cache_after_weight_updates
-            and disaggregated
-        ):
-            raise ValueError(
-                "grpo.async_grpo.recompute_kv_cache_after_weight_updates must be "
-                "false when in_flight_weight_updates is true and "
-                "policy.generation.dynamo_cfg.disaggregation is set: vLLM cannot "
-                "clear the KV cache while decode requests await remote KV transfer."
-            )
-
     def __init__(
         self,
         cluster: Optional[RayVirtualCluster],
@@ -891,8 +853,7 @@ class DynamoGeneration(GenerationInterface):
         They use the keep mode, as for the async GRPO loop: running requests are
         frozen and continue on the new weights after
         :meth:`resume_after_weight_update`. Caches are not cleared. This is
-        :meth:`pause_generation_for_refit` without the cache clear, which a
-        prefill/decode fleet cannot do.
+        :meth:`pause_generation_for_refit` without the cache clear.
         """
         self.pause_generation_for_refit(clear_cache=False)
 
@@ -914,14 +875,14 @@ class DynamoGeneration(GenerationInterface):
 
         Args:
             clear_cache: Clear each engine's KV and prefix caches while paused, so
-                kept requests recompute their KV on the new weights. Not allowed
-                on a prefill/decode fleet.
+                kept requests recompute their KV on the new weights. On a
+                prefill/decode fleet, a request between prefill and decode keeps
+                its old KV. See :meth:`DynamoRefitChannel.pause`.
 
         Returns:
             True once every engine has paused.
 
         Raises:
-            ValueError: If ``clear_cache`` is set on a prefill/decode fleet.
             RuntimeError: If any engine fails to pause; every engine is resumed.
         """
         self._require_refit_channel().pause(mode="keep", clear_cache=clear_cache)
