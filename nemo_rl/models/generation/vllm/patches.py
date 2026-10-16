@@ -344,11 +344,11 @@ def _patch_vllm_reset_cache_with_held_kv(logger) -> bool:
     With a KV connector the patch drops every cached prefix hash instead, as
     ``BlockPool.reset_prefix_cache`` does, and leaves the blocks in use alone. The
     running requests are already preempted by then. The held blocks stay valid for
-    their holders and only stop being cacheable, so no new request hits KV from
-    the old weights. A request that was between prefill and decode at the reset
-    keeps its old KV, and its blocks can enter the prefix cache again when its
-    load ends. This is the one request class that the reset cannot recompute.
-    Without a connector vLLM raises as before.
+    their holders and only stop being cacheable. A decode request that waits for
+    remote KV still holds the old weights' KV, and vLLM caches its blocks again
+    when the load ends; ``_patch_vllm_stale_remote_kv_after_reset`` stops that.
+    A forced reset during a pause also arms that patch. Without a connector vLLM
+    raises as before.
 
     Returns:
         True if the patch is applied, now or before. False if the anchor was not
@@ -392,6 +392,8 @@ def _patch_vllm_reset_cache_with_held_kv(logger) -> bool:
         "        be freed now. They stay valid for their holders and only stop being\n"
         "        cacheable.\n"
         '        """\n'
+        "        if self._pause_state != PauseState.UNPAUSED:\n"
+        "            self._nemo_rl_reset_in_pause = True\n"
         "        block_pool = self.kv_cache_manager.block_pool\n"
         "        block_pool.cached_block_hash_to_block = type(\n"
         "            block_pool.cached_block_hash_to_block\n"
@@ -441,13 +443,108 @@ def _patch_vllm_reset_cache_with_held_kv(logger) -> bool:
     return True
 
 
+def _patch_vllm_stale_remote_kv_after_reset(logger) -> bool:
+    """Keep remote KV from the old weights out of a decode engine's prefix cache.
+
+    A forced cache reset (``_patch_vllm_reset_cache_with_held_kv``) drops every
+    cached prefix hash, but a decode request that waits for remote KV keeps its
+    blocks, and a prefill engine computed that KV on the old weights. When the
+    load ends, ``Scheduler._update_waiting_for_remote_kv`` registers those blocks
+    in the prefix cache again. Later requests, such as the other samples of a
+    GRPO prompt or the requests that the reset preempted, then hit the old KV.
+
+    A decode engine takes a request only after the prefill engine has finished
+    it, and prefill is paused until the refit ends. Every request that reaches a
+    decode engine before it resumes therefore carries old-weight KV. The patch
+    records the time of that resume when a forced reset ran during the pause. A
+    remote load that ends for a request that arrived before that time has its
+    blocks removed from the prefix cache again, so only the request itself reads
+    them.
+
+    Returns:
+        True if the patch is applied, now or before. False if an anchor was not
+        found, so a decode engine can serve KV from the old weights after a
+        cache clear.
+    """
+    try:
+        file_to_patch = _get_vllm_file("v1/core/sched/scheduler.py")
+    except RuntimeError:
+        logger.warning("Could not locate scheduler.py for the stale remote KV patch.")
+        return False
+
+    old_pause = (
+        '        logger.info("setting pause state to %s", pause_state.name)\n'
+        "        self._pause_state = pause_state\n"
+    )
+    new_pause = (
+        '        logger.info("setting pause state to %s", pause_state.name)\n'
+        "        if pause_state == PauseState.UNPAUSED and getattr(\n"
+        '            self, "_nemo_rl_reset_in_pause", False\n'
+        "        ):\n"
+        "            # NeMo RL: remote KV that arrived before this resume is stale.\n"
+        "            self._nemo_rl_reset_in_pause = False\n"
+        "            self._nemo_rl_stale_remote_kv_before = time.time()\n"
+        "        self._pause_state = pause_state\n"
+    )
+    old_remote = (
+        "    def _update_waiting_for_remote_kv(self, request: Request) -> None:\n"
+    )
+    new_remote = (
+        "    def _update_waiting_for_remote_kv(self, request: Request) -> None:\n"
+        "        self._nemo_rl_update_waiting_for_remote_kv(request)\n"
+        "        self._nemo_rl_uncache_stale_remote_kv(request)\n"
+        "\n"
+        "    def _nemo_rl_uncache_stale_remote_kv(self, request: Request) -> None:\n"
+        '        """NeMo RL: do not leave remote KV from the old weights cacheable.\n'
+        "\n"
+        "        A cache reset during a pause dropped every prefix hash, but the load of\n"
+        "        a request that arrived before the resume registers its blocks again.\n"
+        '        """\n'
+        "        stale_before = getattr(self, "
+        '"_nemo_rl_stale_remote_kv_before", 0.0)\n'
+        "        if request.arrival_time > stale_before or not request.num_computed_tokens:\n"
+        "            return\n"
+        "        block_pool = self.kv_cache_manager.block_pool\n"
+        "        blocks = self.kv_cache_manager.get_blocks(request.request_id)\n"
+        "        for group in blocks.blocks:\n"
+        "            for block in group:\n"
+        "                block_pool._maybe_evict_cached_block(block)\n"
+        "\n"
+        "    def _nemo_rl_update_waiting_for_remote_kv(self, request: Request) -> None:\n"
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if "NeMo RL: do not leave remote KV from the old weights cacheable" in content:
+            logger.info("vLLM stale remote KV patch already applied.")
+            return True
+
+        if old_pause not in content or old_remote not in content:
+            logger.warning(
+                "Could not apply the stale remote KV patch: expected "
+                "set_pause_state() or _update_waiting_for_remote_kv() not found "
+                "in %s. The vLLM version may have changed, and a decode engine "
+                "can then serve KV from the old weights after a cache clear.",
+                file_to_patch,
+            )
+            return False
+
+        content = content.replace(old_pause, new_pause, 1)
+        content = content.replace(old_remote, new_remote, 1)
+        write_back(content)
+
+    logger.info("Successfully patched vLLM to keep stale remote KV uncached.")
+    return True
+
+
 def require_held_kv_patches() -> None:
     """Apply the prefill/decode pause patches, and fail if one does not apply.
 
-    A prefill/decode engine needs both patches. Without the first, the pause of a
-    prefill engine waits for a KV lease. Without the second, a pause that clears
-    the caches raises an error. Both fail late and far from their cause, so a
-    prefill/decode worker calls this before it starts ``dynamo.vllm``.
+    A prefill/decode engine needs all three patches. Without the first, the pause
+    of a prefill engine waits for a KV lease. Without the second, a pause that
+    clears the caches raises an error. Without the third, a decode engine caches
+    KV from the old weights again after a cache clear. These fail late and far
+    from their cause, so a prefill/decode worker calls this before it starts
+    ``dynamo.vllm``.
 
     Raises:
         RuntimeError: If the installed vLLM does not match a patch anchor.
@@ -458,6 +555,9 @@ def require_held_kv_patches() -> None:
     results = {
         "pause_with_held_kv": _patch_vllm_pause_with_held_kv(patch_logger),
         "reset_cache_with_held_kv": _patch_vllm_reset_cache_with_held_kv(patch_logger),
+        "stale_remote_kv_after_reset": _patch_vllm_stale_remote_kv_after_reset(
+            patch_logger
+        ),
     }
     unapplied = [name for name, applied in results.items() if not applied]
     if unapplied:
@@ -1238,6 +1338,7 @@ def ensure_vllm_source_compat() -> None:
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_pause_with_held_kv(patch_logger)
     _patch_vllm_reset_cache_with_held_kv(patch_logger)
+    _patch_vllm_stale_remote_kv_after_reset(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
 

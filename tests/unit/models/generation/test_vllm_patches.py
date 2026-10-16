@@ -62,6 +62,8 @@ _PAUSE_PATCH_FN = "_patch_vllm_pause_with_held_kv"
 _PAUSE_MARKER = "NeMo RL: a PAUSED_ALL scheduler does not wait for connector-held"
 _RESET_PATCH_FN = "_patch_vllm_reset_cache_with_held_kv"
 _RESET_MARKER = "NeMo RL: drop every cached prefix hash while some blocks stay in use"
+_STALE_PATCH_FN = "_patch_vllm_stale_remote_kv_after_reset"
+_STALE_MARKER = "NeMo RL: do not leave remote KV from the old weights cacheable"
 _RADIO_SOURCE = "model_executor/models/radio.py"
 _RADIO_PATCH_FN = "_patch_vllm_radio_layerscale_loader"
 _RADIO_MARKER = "initializer_factor = self.config.initializer_factor"
@@ -1202,9 +1204,15 @@ def _scheduler_with_reset_prefix_cache(tmp_path, monkeypatch, *, patch: bool):
     """A stub Scheduler around the real raise branch of reset_prefix_cache()."""
     old_raise, _ = patch_snippets(_RESET_PATCH_FN, "old_raise", "new_raise")
     source = (
+        "import enum\n"
         "import logging\n"
         "\n"
         "logger = logging.getLogger('stub')\n"
+        "\n"
+        "\n"
+        "class PauseState(enum.IntEnum):\n"
+        "    UNPAUSED = 0\n"
+        "    PAUSED_ALL = 2\n"
         "\n"
         "\n"
         "class Scheduler:\n"
@@ -1238,7 +1246,9 @@ class _StubBlock:
         self.cached = False
 
 
-def _stub_scheduler(scheduler_cls, *, reset_succeeds, connector, running=()):
+def _stub_scheduler(
+    scheduler_cls, *, reset_succeeds, connector, running=(), paused_state=0
+):
     from types import SimpleNamespace
 
     blocks = [_StubBlock() for _ in range(3)]
@@ -1260,6 +1270,7 @@ def _stub_scheduler(scheduler_cls, *, reset_succeeds, connector, running=()):
     scheduler.connector = connector
     scheduler.running = list(running)
     scheduler.preempted = []
+    scheduler._pause_state = paused_state
     return scheduler, pool, blocks
 
 
@@ -1281,6 +1292,25 @@ def test_held_kv_reset_patch_forces_the_reset_when_a_connector_holds_blocks(
     assert pool.cached_block_hashes_by_block == {}
     assert not any(block.cached for block in blocks)
     assert scheduler.preempted == ["b", "a"]
+
+
+@pytest.mark.parametrize(("paused_state", "armed"), [(0, False), (2, True)])
+def test_held_kv_reset_patch_arms_the_stale_remote_kv_patch_only_in_a_pause(
+    tmp_path, monkeypatch, paused_state, armed
+):
+    scheduler_cls = _scheduler_with_reset_prefix_cache(
+        tmp_path, monkeypatch, patch=True
+    )
+    scheduler, _, _ = _stub_scheduler(
+        scheduler_cls,
+        reset_succeeds=False,
+        connector=object(),
+        paused_state=paused_state,
+    )
+
+    scheduler.reset_prefix_cache(reset_running_requests=True)
+
+    assert getattr(scheduler, "_nemo_rl_reset_in_pause", False) is armed
 
 
 def test_held_kv_reset_patch_still_raises_without_a_connector(tmp_path, monkeypatch):
@@ -1367,3 +1397,182 @@ def test_the_first_held_kv_patch_reports_whether_it_applied(monkeypatch, tmp_pat
     )
 
     assert patches._patch_vllm_pause_with_held_kv(logging.getLogger(__name__)) is False
+
+
+def _unpatched_stale_source(tmp_path):
+    """The installed scheduler.py with the stale remote KV patch reversed."""
+    from pathlib import Path
+
+    old_pause, new_pause = patch_snippets(_STALE_PATCH_FN, "old_pause", "new_pause")
+    old_remote, new_remote = patch_snippets(_STALE_PATCH_FN, "old_remote", "new_remote")
+    content = Path(patches._get_vllm_file(_PAUSE_SOURCE)).read_text()
+    content = content.replace(new_remote, old_remote, 1)
+    content = content.replace(new_pause, old_pause, 1)
+    assert old_pause in content and old_remote in content, (
+        "the installed scheduler.py has neither form of the stale remote KV anchors"
+    )
+    assert _STALE_MARKER not in content
+    destination = tmp_path / "sched_stale.py"
+    destination.write_text(content)
+    return destination
+
+
+@pytest.fixture
+def patched_stale_source(tmp_path, monkeypatch):
+    copied = _unpatched_stale_source(tmp_path)
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+    assert patches._patch_vllm_stale_remote_kv_after_reset(logging.getLogger(__name__))
+    return copied
+
+
+@pytest.mark.vllm
+def test_stale_remote_kv_patch_anchor_still_matches_installed_vllm(
+    patched_stale_source,
+):
+    content = patched_stale_source.read_text()
+    assert _STALE_MARKER in content, (
+        "the stale remote KV patch did not apply to the installed vLLM; "
+        "set_pause_state() or _update_waiting_for_remote_kv() has probably "
+        "changed upstream. A decode engine can then serve KV from the old weights "
+        "after a cache clear."
+    )
+    ast.parse(content)
+
+
+@pytest.mark.vllm
+def test_stale_remote_kv_patch_is_idempotent(patched_stale_source, monkeypatch):
+    before = patched_stale_source.read_text()
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(patched_stale_source)
+    )
+    assert patches._patch_vllm_stale_remote_kv_after_reset(logging.getLogger(__name__))
+    assert patched_stale_source.read_text() == before
+
+
+def _stale_stub_scheduler(tmp_path, monkeypatch):
+    """A stub Scheduler around the real anchors of the stale remote KV patch."""
+    old_pause, _ = patch_snippets(_STALE_PATCH_FN, "old_pause", "new_pause")
+    old_remote, _ = patch_snippets(_STALE_PATCH_FN, "old_remote", "new_remote")
+    source = (
+        "import enum\n"
+        "import logging\n"
+        "import time\n"
+        "\n"
+        "logger = logging.getLogger('stub')\n"
+        "\n"
+        "\n"
+        "class PauseState(enum.IntEnum):\n"
+        "    UNPAUSED = 0\n"
+        "    PAUSED_ALL = 2\n"
+        "\n"
+        "\n"
+        "class Request:\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "class Scheduler:\n"
+        "    def set_pause_state(self, pause_state):\n"
+        f"{old_pause}"
+        "\n"
+        f"{old_remote}"
+        "        self.finished.append(request.request_id)\n"
+    )
+    file = tmp_path / "stale_stub.py"
+    file.write_text(source)
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(file))
+    assert patches._patch_vllm_stale_remote_kv_after_reset(logging.getLogger(__name__))
+    namespace: dict = {}
+    exec(compile(file.read_text(), str(file), "exec"), namespace)
+    return namespace["Scheduler"], namespace["PauseState"]
+
+
+class _EvictingPool:
+    def __init__(self):
+        self.evicted = []
+
+    def _maybe_evict_cached_block(self, block):
+        self.evicted.append(block)
+        return True
+
+
+def _stale_scheduler(scheduler_cls):
+    scheduler = scheduler_cls()
+    scheduler.finished = []
+    scheduler._pause_state = 2
+    pool = _EvictingPool()
+    scheduler.kv_cache_manager = SimpleNamespace(
+        block_pool=pool,
+        get_blocks=lambda _request_id: SimpleNamespace(blocks=(["b0", "b1"], ["b2"])),
+    )
+    return scheduler, pool
+
+
+def _request(arrival_time, num_computed_tokens=16):
+    return SimpleNamespace(
+        request_id="req",
+        arrival_time=arrival_time,
+        num_computed_tokens=num_computed_tokens,
+    )
+
+
+def test_stale_remote_kv_patch_uncaches_loads_of_requests_that_arrived_before_resume(
+    tmp_path, monkeypatch
+):
+    scheduler_cls, pause_state = _stale_stub_scheduler(tmp_path, monkeypatch)
+    scheduler, pool = _stale_scheduler(scheduler_cls)
+    scheduler._nemo_rl_reset_in_pause = True  # armed by a forced reset
+
+    scheduler.set_pause_state(pause_state.UNPAUSED)
+    resumed_at = scheduler._nemo_rl_stale_remote_kv_before
+
+    assert scheduler._nemo_rl_reset_in_pause is False
+    scheduler._update_waiting_for_remote_kv(_request(resumed_at - 1.0))
+    assert pool.evicted == ["b0", "b1", "b2"]
+    # The wrapped vLLM method still runs.
+    assert scheduler.finished == ["req"]
+
+    # A request that arrived after the resume has KV that the new weights computed.
+    pool.evicted.clear()
+    scheduler._update_waiting_for_remote_kv(_request(resumed_at + 1.0))
+    assert pool.evicted == []
+
+
+def test_stale_remote_kv_patch_does_nothing_without_a_reset_in_the_pause(
+    tmp_path, monkeypatch
+):
+    scheduler_cls, pause_state = _stale_stub_scheduler(tmp_path, monkeypatch)
+    scheduler, pool = _stale_scheduler(scheduler_cls)
+
+    scheduler.set_pause_state(pause_state.UNPAUSED)
+    scheduler._update_waiting_for_remote_kv(_request(1.0))
+
+    assert pool.evicted == []
+    assert scheduler._pause_state == pause_state.UNPAUSED
+
+
+def test_stale_remote_kv_patch_skips_a_load_that_left_no_blocks(tmp_path, monkeypatch):
+    scheduler_cls, _ = _stale_stub_scheduler(tmp_path, monkeypatch)
+    scheduler, pool = _stale_scheduler(scheduler_cls)
+    scheduler._nemo_rl_stale_remote_kv_before = 1e18
+
+    # A failed load with no valid tokens frees the request's blocks.
+    scheduler._update_waiting_for_remote_kv(_request(0.0, num_computed_tokens=0))
+
+    assert pool.evicted == []
+
+
+def test_stale_remote_kv_patch_warns_on_unknown_source(monkeypatch, tmp_path, caplog):
+    scheduler_source = tmp_path / "scheduler.py"
+    scheduler_source.write_text("class Scheduler:\n    pass\n")
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(scheduler_source)
+    )
+
+    with caplog.at_level(logging.WARNING):
+        applied = patches._patch_vllm_stale_remote_kv_after_reset(
+            logging.getLogger(__name__)
+        )
+
+    assert applied is False
+    assert scheduler_source.read_text() == "class Scheduler:\n    pass\n"
+    assert "_update_waiting_for_remote_kv() not found" in caplog.text
