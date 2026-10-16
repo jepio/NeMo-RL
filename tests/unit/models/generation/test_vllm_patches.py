@@ -60,6 +60,8 @@ _MARKER = "except ImportError:  # openai < 2.25.0 predates namespace tools"
 _PAUSE_SOURCE = "v1/core/sched/scheduler.py"
 _PAUSE_PATCH_FN = "_patch_vllm_pause_with_held_kv"
 _PAUSE_MARKER = "NeMo RL: a PAUSED_ALL scheduler does not wait for connector-held"
+_RESET_PATCH_FN = "_patch_vllm_reset_cache_with_held_kv"
+_RESET_MARKER = "NeMo RL: drop every cached prefix hash while some blocks stay in use"
 _RADIO_SOURCE = "model_executor/models/radio.py"
 _RADIO_PATCH_FN = "_patch_vllm_radio_layerscale_loader"
 _RADIO_MARKER = "initializer_factor = self.config.initializer_factor"
@@ -1144,3 +1146,224 @@ def test_held_kv_pause_patch_warns_on_unknown_source(monkeypatch, tmp_path, capl
 
     assert scheduler_source.read_text() == "class Scheduler:\n    pass\n"
     assert "has_finished_requests() not found" in caplog.text
+
+
+def _unpatched_reset_source(tmp_path):
+    """The installed scheduler.py with the held-KV reset patch reversed."""
+    from pathlib import Path
+
+    old_raise, new_raise = patch_snippets(_RESET_PATCH_FN, "old_raise", "new_raise")
+    old_anchor, new_method = patch_snippets(
+        _RESET_PATCH_FN, "old_method_anchor", "new_method"
+    )
+    content = Path(patches._get_vllm_file(_PAUSE_SOURCE)).read_text()
+    content = content.replace(new_method + old_anchor, old_anchor, 1)
+    content = content.replace(new_raise, old_raise, 1)
+    assert old_raise in content and old_anchor in content, (
+        "the installed scheduler.py has neither form of the held-KV reset anchor"
+    )
+    assert _RESET_MARKER not in content
+    destination = tmp_path / "sched_reset.py"
+    destination.write_text(content)
+    return destination
+
+
+@pytest.fixture
+def patched_reset_source(tmp_path, monkeypatch):
+    copied = _unpatched_reset_source(tmp_path)
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+    assert patches._patch_vllm_reset_cache_with_held_kv(logging.getLogger(__name__))
+    return copied
+
+
+@pytest.mark.vllm
+def test_held_kv_reset_patch_anchor_still_matches_installed_vllm(patched_reset_source):
+    """A source edit becomes a silent no-op if upstream rewrites the reset."""
+    content = patched_reset_source.read_text()
+    assert _RESET_MARKER in content, (
+        "the held-KV reset patch did not apply to the installed vLLM; "
+        "Scheduler.reset_prefix_cache() has probably changed upstream. A cache "
+        "clear on a prefill/decode fleet then raises an error."
+    )
+    ast.parse(content)  # the edit must leave valid Python
+
+
+@pytest.mark.vllm
+def test_held_kv_reset_patch_is_idempotent(patched_reset_source, monkeypatch):
+    before = patched_reset_source.read_text()
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(patched_reset_source)
+    )
+    assert patches._patch_vllm_reset_cache_with_held_kv(logging.getLogger(__name__))
+    assert patched_reset_source.read_text() == before
+
+
+def _scheduler_with_reset_prefix_cache(tmp_path, monkeypatch, *, patch: bool):
+    """A stub Scheduler around the real raise branch of reset_prefix_cache()."""
+    old_raise, _ = patch_snippets(_RESET_PATCH_FN, "old_raise", "new_raise")
+    source = (
+        "import logging\n"
+        "\n"
+        "logger = logging.getLogger('stub')\n"
+        "\n"
+        "\n"
+        "class Scheduler:\n"
+        "    def reset_prefix_cache(\n"
+        "        self, reset_running_requests=False, reset_connector=False\n"
+        "    ):\n"
+        "        if reset_running_requests:\n"
+        "            while self.running:\n"
+        "                self.preempted.append(self.running.pop())\n"
+        f"{old_raise}"
+        "        return reset_successful\n"
+        "\n"
+        "    def reset_connector_cache(self) -> bool:\n"
+        "        return True\n"
+    )
+    file = tmp_path / "reset_stub.py"
+    file.write_text(source)
+    if patch:
+        monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(file))
+        assert patches._patch_vllm_reset_cache_with_held_kv(logging.getLogger(__name__))
+    namespace: dict = {}
+    exec(compile(file.read_text(), str(file), "exec"), namespace)
+    return namespace["Scheduler"]
+
+
+class _StubBlock:
+    def __init__(self):
+        self.cached = True
+
+    def reset_hash(self):
+        self.cached = False
+
+
+def _stub_scheduler(scheduler_cls, *, reset_succeeds, connector, running=()):
+    from types import SimpleNamespace
+
+    blocks = [_StubBlock() for _ in range(3)]
+    pool = SimpleNamespace(
+        cached_block_hash_to_block={"hash": 1},
+        cached_block_hashes_by_block={1: "hash"},
+        blocks=blocks,
+        metrics_collector=None,
+        enable_kv_cache_events=False,
+        kv_event_queue=[],
+    )
+    scheduler = scheduler_cls()
+    scheduler.kv_cache_manager = SimpleNamespace(
+        block_pool=pool,
+        log_stats=False,
+        prefix_cache_stats=None,
+        reset_prefix_cache=lambda: reset_succeeds,
+    )
+    scheduler.connector = connector
+    scheduler.running = list(running)
+    scheduler.preempted = []
+    return scheduler, pool, blocks
+
+
+def test_held_kv_reset_patch_forces_the_reset_when_a_connector_holds_blocks(
+    tmp_path, monkeypatch
+):
+    scheduler_cls = _scheduler_with_reset_prefix_cache(
+        tmp_path, monkeypatch, patch=True
+    )
+    scheduler, pool, blocks = _stub_scheduler(
+        scheduler_cls, reset_succeeds=False, connector=object(), running=["a", "b"]
+    )
+
+    assert scheduler.reset_prefix_cache(reset_running_requests=True) is True
+
+    # Every cached hash is gone, so no new request hits the old weights' KV, and
+    # the running requests were still preempted first.
+    assert pool.cached_block_hash_to_block == {}
+    assert pool.cached_block_hashes_by_block == {}
+    assert not any(block.cached for block in blocks)
+    assert scheduler.preempted == ["b", "a"]
+
+
+def test_held_kv_reset_patch_still_raises_without_a_connector(tmp_path, monkeypatch):
+    scheduler_cls = _scheduler_with_reset_prefix_cache(
+        tmp_path, monkeypatch, patch=True
+    )
+    scheduler, _, blocks = _stub_scheduler(
+        scheduler_cls, reset_succeeds=False, connector=None
+    )
+
+    # Without a connector nothing explains the held blocks, so vLLM must not hide it.
+    with pytest.raises(RuntimeError, match="Failed to reset KV cache"):
+        scheduler.reset_prefix_cache(reset_running_requests=True)
+    assert all(block.cached for block in blocks)
+
+
+def test_held_kv_reset_patch_leaves_a_successful_reset_alone(tmp_path, monkeypatch):
+    scheduler_cls = _scheduler_with_reset_prefix_cache(
+        tmp_path, monkeypatch, patch=True
+    )
+    scheduler, _, blocks = _stub_scheduler(
+        scheduler_cls, reset_succeeds=True, connector=object()
+    )
+
+    assert scheduler.reset_prefix_cache(reset_running_requests=True) is True
+    # vLLM's own reset cleared the cache; the patch adds nothing.
+    assert all(block.cached for block in blocks)
+
+
+def test_held_kv_reset_is_needed_without_the_patch(tmp_path, monkeypatch):
+    """Negative control: unpatched vLLM raises when a connector holds blocks."""
+    scheduler_cls = _scheduler_with_reset_prefix_cache(
+        tmp_path, monkeypatch, patch=False
+    )
+    scheduler, _, _ = _stub_scheduler(
+        scheduler_cls, reset_succeeds=False, connector=object()
+    )
+
+    with pytest.raises(RuntimeError, match="Failed to reset KV cache"):
+        scheduler.reset_prefix_cache(reset_running_requests=True)
+
+
+def test_held_kv_reset_patch_warns_on_unknown_source(monkeypatch, tmp_path, caplog):
+    scheduler_source = tmp_path / "scheduler.py"
+    scheduler_source.write_text("class Scheduler:\n    pass\n")
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(scheduler_source)
+    )
+
+    with caplog.at_level(logging.WARNING):
+        applied = patches._patch_vllm_reset_cache_with_held_kv(
+            logging.getLogger(__name__)
+        )
+
+    assert applied is False
+    assert scheduler_source.read_text() == "class Scheduler:\n    pass\n"
+    assert "reset_prefix_cache() not found" in caplog.text
+
+
+def test_require_held_kv_patches_raises_when_an_anchor_is_missing(
+    monkeypatch, tmp_path
+):
+    scheduler_source = tmp_path / "scheduler.py"
+    scheduler_source.write_text("class Scheduler:\n    pass\n")
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(scheduler_source)
+    )
+    vllm_logger = types.ModuleType("vllm.logger")
+    vllm_logger.init_logger = logging.getLogger
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.logger", vllm_logger)
+
+    with pytest.raises(
+        RuntimeError, match="pause_with_held_kv.*reset_cache_with_held_kv"
+    ):
+        patches.require_held_kv_patches()
+
+
+def test_the_first_held_kv_patch_reports_whether_it_applied(monkeypatch, tmp_path):
+    scheduler_source = tmp_path / "scheduler.py"
+    scheduler_source.write_text("class Scheduler:\n    pass\n")
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(scheduler_source)
+    )
+
+    assert patches._patch_vllm_pause_with_held_kv(logging.getLogger(__name__)) is False

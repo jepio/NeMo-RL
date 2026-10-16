@@ -206,9 +206,17 @@ class DynamoVllmWorker:  # pragma: no cover
         # The same on-disk vLLM source fixes the vLLM backend applies (tool-parser
         # namespace, Eagle3 draft lm_head, model loaders). Imports only vLLM's logger, never CUDA: this
         # actor holds no GPU.
-        from nemo_rl.models.generation.vllm.patches import ensure_vllm_source_compat
+        from nemo_rl.models.generation.vllm.patches import (
+            ensure_vllm_source_compat,
+            require_held_kv_patches,
+        )
 
         ensure_vllm_source_compat()
+        if worker_role != "aggregated":
+            # A prefill or decode engine pauses and clears its cache while it holds KV
+            # for the other role. Without these patches the pause waits for a KV lease
+            # or the cache clear raises, and the error points at neither patch.
+            require_held_kv_patches()
         vllm_cfg = validated_config.vllm_cfg.model_dump()
         vllm_kwargs = dict(validated_config.vllm_kwargs)
         engine_env_defaults: dict[str, str] = {}

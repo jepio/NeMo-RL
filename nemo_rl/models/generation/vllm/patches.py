@@ -255,7 +255,7 @@ def _patch_vllm_tool_parser_namespace_tool(logger) -> None:
     logger.info("Successfully patched vLLM NamespaceTool import for openai compat.")
 
 
-def _patch_vllm_pause_with_held_kv(logger) -> None:
+def _patch_vllm_pause_with_held_kv(logger) -> bool:
     """Let a keep-mode pause finish while a prefill engine still holds KV for decode.
 
     A prefill/decode engine with a KV connector keeps the blocks of a finished
@@ -272,15 +272,19 @@ def _patch_vllm_pause_with_held_kv(logger) -> None:
     before. The engine goes idle, so it handles no notification and expires no
     lease until it resumes.
 
-    The patch is only safe for a pause that does not clear the caches: clearing
-    needs to free the held blocks, and vLLM raises when it cannot. It does not
-    change ``PAUSED_NEW``, the state of a ``wait`` pause.
+    A pause that also clears the caches needs ``_patch_vllm_reset_cache_with_held_kv``,
+    because the clear cannot free the held blocks. The patch does not change
+    ``PAUSED_NEW``, the state of a ``wait`` pause.
+
+    Returns:
+        True if the patch is applied, now or before. False if the anchor was not
+        found, so a pause of a prefill engine waits for a KV lease.
     """
     try:
         file_to_patch = _get_vllm_file("v1/core/sched/scheduler.py")
     except RuntimeError:
         logger.warning("Could not locate scheduler.py for the held-KV pause patch.")
-        return
+        return False
 
     old_snippet = (
         "    def has_finished_requests(self) -> bool:\n"
@@ -308,7 +312,7 @@ def _patch_vllm_pause_with_held_kv(logger) -> None:
             in content
         ):
             logger.info("vLLM held-KV pause patch already applied.")
-            return
+            return True
 
         if old_snippet not in content:
             logger.warning(
@@ -317,12 +321,151 @@ def _patch_vllm_pause_with_held_kv(logger) -> None:
                 "have changed, and a P/D pause can then wait for a KV lease.",
                 file_to_patch,
             )
-            return
+            return False
 
         content = content.replace(old_snippet, new_snippet, 1)
         write_back(content)
 
     logger.info("Successfully patched vLLM to pause without waiting for held KV.")
+    return True
+
+
+def _patch_vllm_reset_cache_with_held_kv(logger) -> bool:
+    """Let a forced cache reset finish while KV is held for a connector.
+
+    ``Scheduler.reset_prefix_cache(reset_running_requests=True)`` preempts the
+    running requests and then needs every block free. A prefill engine still holds
+    the KV of finished requests for a decode engine, and a decode engine holds the
+    blocks of requests that wait for remote KV. These blocks stay in use, and vLLM
+    raises "Failed to reset KV cache ... which is not supported yet". A pause that
+    clears the caches, as ``recompute_kv_cache_after_weight_updates`` asks for,
+    then fails on a prefill/decode fleet.
+
+    With a KV connector the patch drops every cached prefix hash instead, as
+    ``BlockPool.reset_prefix_cache`` does, and leaves the blocks in use alone. The
+    running requests are already preempted by then. The held blocks stay valid for
+    their holders and only stop being cacheable, so no new request hits KV from
+    the old weights. A request that was between prefill and decode at the reset
+    keeps its old KV, and its blocks can enter the prefix cache again when its
+    load ends. This is the one request class that the reset cannot recompute.
+    Without a connector vLLM raises as before.
+
+    Returns:
+        True if the patch is applied, now or before. False if the anchor was not
+        found, so a cache clear on a prefill/decode fleet raises an error.
+    """
+    try:
+        file_to_patch = _get_vllm_file("v1/core/sched/scheduler.py")
+    except RuntimeError:
+        logger.warning("Could not locate scheduler.py for the held-KV reset patch.")
+        return False
+
+    old_raise = (
+        "        reset_successful = self.kv_cache_manager.reset_prefix_cache()\n"
+        "        if reset_running_requests and not reset_successful:\n"
+        "            raise RuntimeError(\n"
+        '                "Failed to reset KV cache even when all the running requests are "\n'
+        '                "preempted and moved to the waiting queue. This is likely due to "\n'
+        '                "the presence of running requests waiting for remote KV transfer, "\n'
+        '                "which is not supported yet."\n'
+        "            )\n"
+    )
+    new_raise = (
+        "        reset_successful = self.kv_cache_manager.reset_prefix_cache()\n"
+        "        if reset_running_requests and not reset_successful:\n"
+        "            if self.connector is None:\n"
+        "                raise RuntimeError(\n"
+        '                    "Failed to reset KV cache even when all the running requests are "\n'
+        '                    "preempted and moved to the waiting queue. This is likely due to "\n'
+        '                    "the presence of running requests waiting for remote KV transfer, "\n'
+        '                    "which is not supported yet."\n'
+        "                )\n"
+        "            self._nemo_rl_force_reset_prefix_cache()\n"
+        "            reset_successful = True\n"
+    )
+    old_method_anchor = "    def reset_connector_cache(self) -> bool:\n"
+    new_method = (
+        "    def _nemo_rl_force_reset_prefix_cache(self) -> None:\n"
+        '        """NeMo RL: drop every cached prefix hash while some blocks stay in use.\n'
+        "\n"
+        "        Blocks that a KV connector holds, or that wait for a remote load, cannot\n"
+        "        be freed now. They stay valid for their holders and only stop being\n"
+        "        cacheable.\n"
+        '        """\n'
+        "        block_pool = self.kv_cache_manager.block_pool\n"
+        "        block_pool.cached_block_hash_to_block = type(\n"
+        "            block_pool.cached_block_hash_to_block\n"
+        "        )()\n"
+        "        block_pool.cached_block_hashes_by_block.clear()\n"
+        "        for block in block_pool.blocks:\n"
+        "            block.reset_hash()\n"
+        "        if block_pool.metrics_collector:\n"
+        "            block_pool.metrics_collector.reset()\n"
+        "        if block_pool.enable_kv_cache_events:\n"
+        "            from vllm.distributed.kv_events import AllBlocksCleared\n"
+        "\n"
+        "            block_pool.kv_event_queue.append(AllBlocksCleared())\n"
+        "        if self.kv_cache_manager.log_stats:\n"
+        "            assert self.kv_cache_manager.prefix_cache_stats is not None\n"
+        "            self.kv_cache_manager.prefix_cache_stats.reset = True\n"
+        "        logger.warning(\n"
+        '            "Reset the prefix cache while some blocks are in use: a KV connector "\n'
+        '            "holds them, or they wait for remote KV."\n'
+        "        )\n"
+        "\n"
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if (
+            "NeMo RL: drop every cached prefix hash while some blocks stay in use"
+            in content
+        ):
+            logger.info("vLLM held-KV reset patch already applied.")
+            return True
+
+        if old_raise not in content or old_method_anchor not in content:
+            logger.warning(
+                "Could not apply the held-KV reset patch: expected "
+                "reset_prefix_cache() not found in %s. The vLLM version may have "
+                "changed, and a cache clear on a prefill/decode fleet then raises "
+                "an error.",
+                file_to_patch,
+            )
+            return False
+
+        content = content.replace(old_raise, new_raise, 1)
+        content = content.replace(old_method_anchor, new_method + old_method_anchor, 1)
+        write_back(content)
+
+    logger.info("Successfully patched vLLM to reset the cache with held KV.")
+    return True
+
+
+def require_held_kv_patches() -> None:
+    """Apply the prefill/decode pause patches, and fail if one does not apply.
+
+    A prefill/decode engine needs both patches. Without the first, the pause of a
+    prefill engine waits for a KV lease. Without the second, a pause that clears
+    the caches raises an error. Both fail late and far from their cause, so a
+    prefill/decode worker calls this before it starts ``dynamo.vllm``.
+
+    Raises:
+        RuntimeError: If the installed vLLM does not match a patch anchor.
+    """
+    from vllm.logger import init_logger
+
+    patch_logger = init_logger("vllm_patch")
+    results = {
+        "pause_with_held_kv": _patch_vllm_pause_with_held_kv(patch_logger),
+        "reset_cache_with_held_kv": _patch_vllm_reset_cache_with_held_kv(patch_logger),
+    }
+    unapplied = [name for name, applied in results.items() if not applied]
+    if unapplied:
+        raise RuntimeError(
+            "The installed vLLM does not match the anchor of the patches "
+            f"{unapplied} that prefill/decode engines need. Check the vLLM version "
+            "against nemo_rl/models/generation/vllm/patches.py."
+        )
 
 
 def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
@@ -1094,6 +1237,7 @@ def ensure_vllm_source_compat() -> None:
     _patch_vllm_llama_eagle3_own_lm_head(patch_logger)
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_pause_with_held_kv(patch_logger)
+    _patch_vllm_reset_cache_with_held_kv(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
 

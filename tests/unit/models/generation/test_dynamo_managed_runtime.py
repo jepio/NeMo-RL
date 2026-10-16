@@ -514,6 +514,11 @@ def test_worker_registers_process_group_immediately_after_launch(
         "nemo_rl.models.generation.vllm.patches.ensure_vllm_source_compat",
         lambda: None,
     )
+    held_kv_checks = []
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.patches.require_held_kv_patches",
+        lambda: held_kv_checks.append("checked"),
+    )
 
     def fake_popen(command, **kwargs):
         launch["command"] = command
@@ -565,6 +570,8 @@ def test_worker_registers_process_group_immediately_after_launch(
     )
 
     assert reservation.register_process_group.calls == [((4321,), {})]
+    # A prefill engine must not start without the held-KV patches.
+    assert held_kv_checks == ["checked"]
     command, env = launch["command"], launch["env"]
     assert command[command.index("--dtype") + 1] == "bfloat16"
     if precision == "fp8":
