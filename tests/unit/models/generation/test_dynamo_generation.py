@@ -507,7 +507,7 @@ def test_drain_for_weight_update_freezes_every_worker_and_resume_restores_them(
     generation = pickle.loads(
         pickle.dumps(DynamoGeneration(cluster=object(), config=_config()))
     )
-    generation.drain_for_weight_update()
+    assert generation.drain_for_weight_update(clear_cache=False) is False
     # The SingleController freezes the requests, as the async loop does, and does
     # not clear the caches: a prefill/decode fleet cannot clear them while it pauses.
     assert [(call["route"], call["payload"]) for call in calls] == [
@@ -612,6 +612,32 @@ def test_failed_in_flight_pause_resumes_every_worker(monkeypatch) -> None:
         ("pause_generation", "http://worker-b:4000"),
         ("resume_generation", "http://worker-a:4000"),
         ("resume_generation", "http://worker-b:4000"),
+    ]
+
+
+@pytest.mark.parametrize("role", ["aggregated", "decode"])
+def test_drain_for_weight_update_clears_the_caches_and_reports_it(
+    monkeypatch, role
+) -> None:
+    _patch_runtime(
+        monkeypatch,
+        workers=[
+            {"instance_id": "a", "system_url": "http://a:4000", "role": role},
+        ],
+    )
+    calls = []
+    monkeypatch.setattr(
+        refit_module._post_worker_route,
+        "remote",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+    monkeypatch.setattr(refit_module.ray, "get", lambda refs: refs)
+    generation = DynamoGeneration(cluster=object(), config=_config())
+
+    # True tells the SingleController that the pause already cleared the caches.
+    assert generation.drain_for_weight_update(clear_cache=True) is True
+    assert [call["payload"] for call in calls] == [
+        {"mode": "keep", "clear_cache": True}
     ]
 
 

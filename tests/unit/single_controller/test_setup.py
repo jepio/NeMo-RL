@@ -434,15 +434,16 @@ def test_dynamo_disaggregation_needs_a_refit_deadline():
         sc_setup_mod.DynamoGeneration.validate_settings(master_config)
 
 
-def test_dynamo_disaggregation_lease_must_cover_a_refit_and_its_retry():
-    master_config = _disaggregated_dynamo_sc_config(lease_s=719)
+def test_dynamo_disaggregation_lease_must_cover_one_refit_window_with_headroom():
+    master_config = _disaggregated_dynamo_sc_config(lease_s=539)
     master_config.async_rl.generation_fleet_health.refit_timeout_s = 300.0
 
-    # 2 * (300 + 60) = 720 s: one refit and one retry while the engines stay paused.
-    with pytest.raises(ValueError, match="at least 720 s"):
+    # 1.5 * (300 + 60) = 540 s. Fleet health is off for Dynamo, so a failed refit is
+    # not retried: one window plus the heartbeat phase and a rollback is enough.
+    with pytest.raises(ValueError, match="at least 540 s"):
         sc_setup_mod.DynamoGeneration.validate_settings(master_config)
 
-    master_config = _disaggregated_dynamo_sc_config(lease_s=720)
+    master_config = _disaggregated_dynamo_sc_config(lease_s=540)
     master_config.async_rl.generation_fleet_health.refit_timeout_s = 300.0
     sc_setup_mod.DynamoGeneration.validate_settings(master_config)
 
@@ -1681,13 +1682,6 @@ class TestSetup:
                 ),
                 "Dynamo frontend owns request routing",
                 id="fleet_health",
-            ),
-            pytest.param(
-                lambda mc: setattr(
-                    mc.async_rl, "recompute_kv_cache_after_weight_updates", True
-                ),
-                "recompute_kv_cache_after_weight_updates must be false",
-                id="refit_pause_does_not_clear_caches",
             ),
             pytest.param(
                 lambda mc: mc.policy["generation"]["dynamo_cfg"].update(

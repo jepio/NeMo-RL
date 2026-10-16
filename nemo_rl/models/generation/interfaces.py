@@ -686,14 +686,23 @@ class GenerationInterface(ABC):
         _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
         return False
 
-    def drain_for_weight_update(self) -> None:
+    def drain_for_weight_update(self, *, clear_cache: bool) -> bool:
         """Make the engine safe for a weight update that the SingleController starts.
 
         The default is a no-op, for engines that take weight updates while they
         serve. A backend whose weight update is unsafe while a request runs
         overrides it. Managed Dynamo freezes its in-flight requests, so they
         continue on the new weights, as :meth:`pause_generation_for_refit` does.
+
+        Args:
+            clear_cache: Whether the caller wants the engine's reusable caches
+                invalidated for the new weights.
+
+        Returns:
+            True if the engine cleared its caches as part of this call. The caller
+            then skips :meth:`invalidate_kv_cache`. False if it did not.
         """
+        return False
 
     def resume_after_weight_update(self) -> None:
         """Resume serving after :meth:`drain_for_weight_update`."""

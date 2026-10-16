@@ -9,8 +9,8 @@
 defaults: grpo_math_1B_megatron_single_controller.yaml
 
 async_rl:
-  # The refit pause does not clear the KV or prefix cache: a prefill/decode fleet
-  # cannot clear them while it pauses, so setup rejects true.
+  # True clears the KV and prefix cache during the refit pause, so that no new
+  # request reuses a block that the old weights computed.
   recompute_kv_cache_after_weight_updates: false
 
 policy:

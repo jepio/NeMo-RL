@@ -651,7 +651,7 @@ def _build_generation(
             cluster=inference_cluster,
             config=cast(dict[str, Any], generation_config),
             tokenizer=tokenizer,
-            tokenizer_config=master_config.policy.get("tokenizer"),
+            tokenizer_config=master_config.policy["tokenizer"],
         )
 
     else:

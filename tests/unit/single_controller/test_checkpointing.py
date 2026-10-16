@@ -443,8 +443,8 @@ class _FakeGeneration:
     def wake_carries_weight_updates(self) -> bool:
         return True
 
-    def drain_for_weight_update(self) -> None:
-        pass
+    def drain_for_weight_update(self, *, clear_cache: bool) -> bool:
+        return False
 
     def resume_after_weight_update(self) -> None:
         pass

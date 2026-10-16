@@ -542,8 +542,8 @@ class DynamoRefitChannel:
         """Ask every engine to reset its prefix cache, without a pause or a drain.
 
         Dynamo's ``flush_cache`` route resets the cache and does not touch running
-        requests. vLLM then keeps any block that a running request or a held KV
-        lease still uses, so the reset can be partial. The route reports success
+        requests. vLLM skips the whole reset, with a warning, when a running
+        request or a held KV lease still uses a block. The route reports success
         either way, so only a failed call raises an error.
 
         Raises:

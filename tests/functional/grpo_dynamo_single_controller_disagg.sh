@@ -92,7 +92,9 @@ fi
 sync_count=$(grep -Fc "_sync_weights: sync done" "${RUN_LOG}" || true)
 pause_count=$(grep -Fc "[RL] Engine paused (mode=keep, clear_cache=False)" "${RUN_LOG}" || true)
 resume_count=$(grep -Fc "[RL] Engine resumed" "${RUN_LOG}" || true)
-if [[ "${sync_count}" -lt 2 || "${pause_count}" -lt "${sync_count}" || "${resume_count}" -lt "${sync_count}" ]]; then
+# Two engines (prefill and decode), so each sync pauses and resumes both: a refit that
+# froze only one engine would pass a count of one per sync.
+if [[ "${sync_count}" -lt 2 || "${pause_count}" -lt $((2 * sync_count)) || "${resume_count}" -lt $((2 * sync_count)) ]]; then
   echo "Expected every weight sync to pause and resume Dynamo; syncs=${sync_count}, pauses=${pause_count}, resumes=${resume_count}" >&2
   exit 1
 fi

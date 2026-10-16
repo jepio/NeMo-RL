@@ -55,6 +55,10 @@ LOGGER = logging.getLogger(__name__)
 
 # Margin for the pause and resume calls around one refit, on top of its deadline.
 _REFIT_PAUSE_MARGIN_S = 60
+# Headroom of the KV lease over one refit window. A decode engine heartbeats every
+# lease/6, so up to a sixth of the lease is spent when a pause starts, and a rollback
+# adds a resume.
+_LEASE_HEADROOM = 1.5
 
 _HTTP_MAX_ATTEMPTS = 3
 _HTTP_RETRY_DELAY_S = 1.0
@@ -169,14 +173,6 @@ class DynamoGeneration(GenerationInterface):
                 "policy.generation.backend='dynamo'; the Dynamo frontend owns request "
                 "routing. Set async_rl.generation_fleet_health.enabled=false."
             )
-        if master_config.async_rl.recompute_kv_cache_after_weight_updates:
-            # The pause that surrounds a refit never clears the caches: a
-            # prefill/decode fleet cannot clear them while it pauses.
-            raise ValueError(
-                "async_rl.recompute_kv_cache_after_weight_updates must be false with "
-                "policy.generation.backend='dynamo'; the refit pause does not clear "
-                "the KV or prefix cache."
-            )
         # Setup has already normalized this through DynamoConfig.
         generation = cast(dict[str, Any], master_config.policy["generation"])
         dynamo_cfg = generation["dynamo_cfg"]
@@ -201,15 +197,20 @@ class DynamoGeneration(GenerationInterface):
                     "refit deadline the engines can stay paused longer than the "
                     "KV lease, and a decode engine can then read wrong KV."
                 )
-            # One refit and one retry, each with the pause and resume margin.
-            needed_lease_s = math.ceil(2 * (refit_timeout_s + _REFIT_PAUSE_MARGIN_S))
+            # One refit window: the refit deadline plus the pause and resume
+            # margin. Decode engines heartbeat every lease/6 while they step, so at
+            # the start of a pause up to a sixth of the lease can be spent already.
+            needed_lease_s = math.ceil(
+                _LEASE_HEADROOM * (refit_timeout_s + _REFIT_PAUSE_MARGIN_S)
+            )
             if disaggregation["kv_lease_duration_s"] < needed_lease_s:
                 raise ValueError(
                     "policy.generation.dynamo_cfg.disaggregation.kv_lease_duration_s "
                     f"({disaggregation['kv_lease_duration_s']}) must be at least "
-                    f"{needed_lease_s} s: twice (refit_timeout_s={refit_timeout_s} "
-                    f"+ {_REFIT_PAUSE_MARGIN_S} s), because the SingleController "
-                    "retries a failed refit once while the engines stay paused."
+                    f"{needed_lease_s} s: {_LEASE_HEADROOM} times "
+                    f"(refit_timeout_s={refit_timeout_s} + {_REFIT_PAUSE_MARGIN_S} s). "
+                    "A lease that ends during a refit lets a prefill engine free KV "
+                    "that a frozen decode engine has not read."
                 )
         if generation["vllm_cfg"]["enable_vllm_metrics_logger"]:
             # Only the legacy GRPO loop reads and clears the driver's sampler; here
@@ -351,9 +352,9 @@ class DynamoGeneration(GenerationInterface):
 
         The async trainers call this after validation while rollouts can still be
         in flight, so it must not drain or pause the engines. A drain would hold
-        every rollout, and on a prefill/decode fleet a ``wait`` pause stalls and the
-        cache clear can raise. The reset keeps blocks that a running request or a
-        held KV lease still uses.
+        every rollout, and on a prefill/decode fleet a ``wait`` pause stalls. vLLM
+        skips the whole reset, with a warning, while a running request or a held KV
+        lease still uses a block.
         """
         self._require_refit_channel().reset_prefix_cache()
         return True
@@ -846,16 +847,26 @@ class DynamoGeneration(GenerationInterface):
             raise RuntimeError("Dynamo refit channel is unavailable")
         return channel.flush_cache()
 
-    def drain_for_weight_update(self) -> None:
+    def drain_for_weight_update(self, *, clear_cache: bool) -> bool:
         """Freeze every engine before a SingleController weight update.
 
         Layerwise reload is unsafe beside a running request, so the engines pause.
         They use the keep mode, as for the async GRPO loop: running requests are
         frozen and continue on the new weights after
-        :meth:`resume_after_weight_update`. Caches are not cleared. This is
-        :meth:`pause_generation_for_refit` without the cache clear.
+        :meth:`resume_after_weight_update`. With ``clear_cache`` each engine also
+        clears its KV and prefix caches while frozen, so the running requests
+        recompute on the new weights. This is
+        :meth:`pause_generation_for_refit`.
+
+        Args:
+            clear_cache: Clear each engine's caches during the pause.
+
+        Returns:
+            ``clear_cache``: the pause already cleared the caches, so the caller
+            must not invalidate them again after the refit.
         """
-        self.pause_generation_for_refit(clear_cache=False)
+        self.pause_generation_for_refit(clear_cache=clear_cache)
+        return clear_cache
 
     def resume_after_weight_update(self) -> None:
         """Resume every engine after a SingleController weight update."""

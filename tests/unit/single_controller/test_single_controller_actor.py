@@ -676,7 +676,7 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     ctrl._gen = SimpleNamespace(
         invalidate_kv_cache=MagicMock(),
         requires_kv_scale_sync=False,
-        drain_for_weight_update=MagicMock(),
+        drain_for_weight_update=MagicMock(return_value=False),
         resume_after_weight_update=MagicMock(),
     )
     ctrl._inflight_by_group_id = {}
@@ -709,7 +709,7 @@ def _drain_ordering_controller(*, sync_weights: MagicMock):
         "invalidate_kv_cache",
         "resume_after_weight_update",
     ):
-        calls.attach_mock(MagicMock(), name)
+        calls.attach_mock(MagicMock(return_value=False), name)
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=calls.sync_weights)
     ctrl._trainer = SimpleNamespace(sync_params_before_refit=MagicMock())
     ctrl._timer = Timer()
@@ -744,6 +744,41 @@ def test_sync_weights_drains_generation_around_the_weight_update() -> None:
     assert ctrl._rollout_permitted.is_set()
 
 
+def test_sync_weights_passes_the_recompute_flag_to_the_drain_hook() -> None:
+    ctrl, calls = _drain_ordering_controller(sync_weights=MagicMock())
+
+    asyncio.run(ctrl._sync_weights())
+
+    calls.drain_for_weight_update.assert_called_once_with(clear_cache=True)
+
+
+def test_sync_weights_skips_the_second_invalidation_when_the_drain_cleared_the_cache() -> (
+    None
+):
+    ctrl, calls = _drain_ordering_controller(sync_weights=MagicMock())
+    # Managed Dynamo clears its caches while its engines are frozen.
+    calls.drain_for_weight_update.return_value = True
+
+    asyncio.run(ctrl._sync_weights())
+
+    assert [call[0] for call in calls.mock_calls] == [
+        "drain_for_weight_update",
+        "sync_weights",
+        "resume_after_weight_update",
+    ]
+    calls.invalidate_kv_cache.assert_not_called()
+
+
+def test_sync_weights_asks_for_no_clear_when_recompute_is_off() -> None:
+    ctrl, calls = _drain_ordering_controller(sync_weights=MagicMock())
+    ctrl._async_cfg = AsyncRLConfig(recompute_kv_cache_after_weight_updates=False)
+
+    asyncio.run(ctrl._sync_weights())
+
+    calls.drain_for_weight_update.assert_called_once_with(clear_cache=False)
+    calls.invalidate_kv_cache.assert_not_called()
+
+
 def test_sync_weights_resumes_generation_when_the_weight_update_fails() -> None:
     ctrl, calls = _drain_ordering_controller(
         sync_weights=MagicMock(side_effect=RuntimeError("nccl failed")),
@@ -773,7 +808,7 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     ctrl._gen = SimpleNamespace(
         invalidate_kv_cache=MagicMock(),
         requires_kv_scale_sync=True,
-        drain_for_weight_update=MagicMock(),
+        drain_for_weight_update=MagicMock(return_value=False),
         resume_after_weight_update=MagicMock(),
     )
     ctrl._trainer = SimpleNamespace(
