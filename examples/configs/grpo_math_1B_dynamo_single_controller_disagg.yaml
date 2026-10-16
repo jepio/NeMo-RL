@@ -12,7 +12,7 @@ policy:
         # Seconds a prefill engine holds KV for a decode engine to pull. The decode
         # engines are frozen during a refit and send no heartbeat, so the lease must
         # outlast it. Setup requires at least twice control_timeout_s, and at least
-        # 1.5 times (async_rl.generation_fleet_health.refit_timeout_s + 60).
+        # twice (async_rl.generation_fleet_health.refit_timeout_s + 60).
         kv_lease_duration_s: 1800
     colocated:
       resources:

@@ -55,10 +55,10 @@ LOGGER = logging.getLogger(__name__)
 
 # Margin for the pause and resume calls around one refit, on top of its deadline.
 _REFIT_PAUSE_MARGIN_S = 60
-# Headroom of the KV lease over one refit window. A decode engine heartbeats every
-# lease/6, so up to a sixth of the lease is spent when a pause starts, and a rollback
-# adds a resume.
-_LEASE_HEADROOM = 1.5
+# Ratio of the KV lease to one refit window. A heartbeat renews a lease to two
+# thirds of its length and decode engines heartbeat every sixth, so a pause can start
+# with only half of the lease left, and the refit window must fit in that half.
+_LEASE_HEADROOM = 2.0
 
 _HTTP_MAX_ATTEMPTS = 3
 _HTTP_RETRY_DELAY_S = 1.0
@@ -198,8 +198,9 @@ class DynamoGeneration(GenerationInterface):
                     "KV lease, and a decode engine can then read wrong KV."
                 )
             # One refit window: the refit deadline plus the pause and resume
-            # margin. Decode engines heartbeat every lease/6 while they step, so at
-            # the start of a pause up to a sixth of the lease can be spent already.
+            # margin. A heartbeat renews a lease to 2/3 of its length and decode
+            # engines send one every 1/6 while they step, so a pause can start with
+            # only 1/2 of the lease left.
             needed_lease_s = math.ceil(
                 _LEASE_HEADROOM * (refit_timeout_s + _REFIT_PAUSE_MARGIN_S)
             )
@@ -887,8 +888,8 @@ class DynamoGeneration(GenerationInterface):
         Args:
             clear_cache: Clear each engine's KV and prefix caches while paused, so
                 kept requests recompute their KV on the new weights. On a
-                prefill/decode fleet, a request between prefill and decode keeps
-                its old KV. See :meth:`DynamoRefitChannel.pause`.
+                prefill/decode fleet, a request between prefill and decode reads
+                its own old KV once and does not share it. See :meth:`DynamoRefitChannel.pause`.
 
         Returns:
             True once every engine has paused.

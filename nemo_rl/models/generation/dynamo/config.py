@@ -163,11 +163,15 @@ class DynamoDisaggregationConfig(BaseModel, extra="forbid"):
             prefill engine frees the blocks when the lease ends, even if the
             decode engine has not pulled them. A decode engine does not check the
             lease before it reads, so it can then read freed memory and use wrong
-            KV without an error. Keep the lease longer than the longest pause,
-            which a refit bounds with ``dynamo_cfg.control_timeout_s``. Setup
-            requires at least twice that time. The cost of a long lease is that
-            KV from a lost handoff stays allocated on the prefill engine until it
-            ends.
+            KV without an error. A heartbeat renews a lease to two thirds of its
+            length and decode engines heartbeat every sixth, so a pause can start
+            with half of the lease left. Keep half of the lease longer than the
+            longest pause. Setup requires a lease of at least twice
+            ``dynamo_cfg.control_timeout_s``, and the SingleController of at least
+            twice its refit window. The legacy GRPO loop does not bound the time
+            between pause and resume, so size the lease for the longest refit
+            there. The cost of a long lease is that KV from a lost handoff stays
+            allocated on the prefill engine until it ends.
     """
 
     prefill_workers: PositiveInt
@@ -201,8 +205,8 @@ class DynamoCfg(BaseModel, extra="forbid"):
                 f"control_timeout_s ({self.control_timeout_s}). Decode engines "
                 "send no heartbeat while a refit pauses them. A prefill engine "
                 "frees KV when the lease ends, and a decode engine can then read "
-                "wrong KV without an error. The lease must cover the refit and a "
-                "rollback."
+                "wrong KV without an error. A pause can start with half of the "
+                "lease left, and that half must cover the refit."
             )
         return self
 

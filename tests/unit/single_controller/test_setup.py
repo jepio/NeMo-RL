@@ -435,15 +435,15 @@ def test_dynamo_disaggregation_needs_a_refit_deadline():
 
 
 def test_dynamo_disaggregation_lease_must_cover_one_refit_window_with_headroom():
-    master_config = _disaggregated_dynamo_sc_config(lease_s=539)
+    master_config = _disaggregated_dynamo_sc_config(lease_s=719)
     master_config.async_rl.generation_fleet_health.refit_timeout_s = 300.0
 
-    # 1.5 * (300 + 60) = 540 s. Fleet health is off for Dynamo, so a failed refit is
-    # not retried: one window plus the heartbeat phase and a rollback is enough.
-    with pytest.raises(ValueError, match="at least 540 s"):
+    # 2 * (300 + 60) = 720 s. A heartbeat renews a lease to 2/3 of its length and
+    # engines send one every 1/6, so a pause can start with half of the lease left.
+    with pytest.raises(ValueError, match="at least 720 s"):
         sc_setup_mod.DynamoGeneration.validate_settings(master_config)
 
-    master_config = _disaggregated_dynamo_sc_config(lease_s=540)
+    master_config = _disaggregated_dynamo_sc_config(lease_s=720)
     master_config.async_rl.generation_fleet_health.refit_timeout_s = 300.0
     sc_setup_mod.DynamoGeneration.validate_settings(master_config)
 

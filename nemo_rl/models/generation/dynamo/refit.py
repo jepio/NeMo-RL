@@ -438,9 +438,10 @@ class DynamoRefitChannel:
 
         A paused decode engine sends no heartbeat, so the leases of the KV that a
         prefill engine holds for it run on during the pause. The first step of a
-        resumed decode engine sends the heartbeat that extends them. A resumed
-        prefill engine expires the leases that ended, so it must not resume before
-        the decode engines can heartbeat.
+        resumed decode engine sends the heartbeat that extends them, on its first
+        step after the resume. A resumed prefill engine expires the leases that
+        ended, so it resumes last. The order only narrows the gap: a resume call
+        returns before the decode heartbeat, and the lease length is the guard.
         """
         resume_errors: list[str] = []
         for group in (
@@ -500,12 +501,14 @@ class DynamoRefitChannel:
             mode: How workers treat requests they are running.
             clear_cache: Clear each engine's KV and prefix caches once paused. The
                 running requests are preempted, so they recompute their KV on the
-                new weights, and no new request hits the prefix cache of the old
+                new weights, and no later request hits the prefix cache of the old
                 weights. On a prefill/decode fleet this needs
-                ``_patch_vllm_reset_cache_with_held_kv``: the KV that a prefill
+                ``_patch_vllm_reset_cache_with_held_kv`` and
+                ``_patch_vllm_stale_remote_kv_after_reset``: the KV that a prefill
                 engine holds for decode, and the blocks of a decode request that
-                waits for remote KV, stay in use. They only stop being cacheable. A
-                request that is between prefill and decode keeps its old KV.
+                waits for remote KV, stay in use and only stop being cacheable. A
+                request that is between prefill and decode reads its own old KV
+                once and does not share it.
 
         Raises:
             ValueError: If ``mode="wait"`` is used on a prefill/decode fleet. No

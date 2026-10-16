@@ -69,9 +69,11 @@ A Dynamo upgrade must update and reverify these coupled locations:
   `managed_runtime.py` counts, and vLLM's `kv_load_failure_policy` and
   `kv_lease_duration` settings
 - `nemo_rl/models/generation/vllm/patches.py`
-  (`_patch_vllm_pause_with_held_kv`, `_patch_vllm_reset_cache_with_held_kv`): the
-  text of `Scheduler.has_finished_requests()` and of the failure branch of
-  `Scheduler.reset_prefix_cache()` in the new vLLM release. A missing anchor stops
+  (`_patch_vllm_pause_with_held_kv`, `_patch_vllm_reset_cache_with_held_kv`,
+  `_patch_vllm_stale_remote_kv_after_reset`): the text of
+  `Scheduler.has_finished_requests()`, the failure branch of
+  `Scheduler.reset_prefix_cache()`, `Scheduler.set_pause_state()` and
+  `Scheduler._update_waiting_for_remote_kv()` in the new vLLM release. A missing anchor stops
   a prefill or decode worker at startup (`require_held_kv_patches`). Run the
   `test_held_kv_*` tests against the new release
 - `nemo_rl/models/generation/dynamo/refit.py`: the `/engine/*` RL routes it
@@ -208,10 +210,12 @@ Two managed vLLM settings keep disaggregation robust across refits:
   frozen engine sends no heartbeat, so the lease runs on during the pause. A
   prefill engine frees the blocks when the lease ends, even if decode has not read
   them, and decode does not check before it reads, so it can use wrong KV without
-  an error. The lease must outlast the pause. Setup requires at least twice
-  `dynamo_cfg.control_timeout_s`, which covers a refit and a rollback. The
-  SingleController also requires at least 1.5 times
-  (`refit_timeout_s` + 60 s). The cost of a long lease is that KV from a lost
+  an error. A heartbeat renews a lease to two thirds of its length and decode
+  engines send one every sixth, so a pause can start with half of the lease left,
+  and that half must outlast the pause. Setup requires at least twice
+  `dynamo_cfg.control_timeout_s`. The SingleController also requires at least twice
+  (`refit_timeout_s` + 60 s). The legacy loop does not bound the time between pause
+  and resume, so size the lease for twice your longest refit. The cost of a long lease is that KV from a lost
   handoff stays allocated on the prefill engine until the lease ends.
 
 ## In-flight weight updates
@@ -239,10 +243,12 @@ active trajectory to finish before the refit, as before.
 - `true`: each engine clears its KV and prefix caches while paused, so kept
   requests recompute their KV on the new weights. This works with in-flight
   updates on an aggregated and on a prefill/decode fleet. On a prefill/decode
-  fleet a second vLLM patch drops the cached prefix hashes while KV stays held
-  (see [the design document](../design-docs/dynamo-integration.md#vllm-source-patches)).
-  One request class keeps old-weight KV: a request that was between prefill and
-  decode at the refit.
+  fleet two more vLLM patches drop the cached prefix hashes while KV stays held,
+  and keep KV that a prefill engine computed on the old weights out of the decode
+  prefix cache (see
+  [the design document](../design-docs/dynamo-integration.md#vllm-source-patches)).
+  A request that was between prefill and decode at the refit reads its own old KV
+  once and does not share it.
 - `false`: kept requests continue with the KV they computed on the old weights.
 
 Operational notes:
@@ -408,7 +414,7 @@ Limits on this path:
   `async_rl.generation_fleet_health.refit_timeout_s`. Requests stay open while the
   engines are frozen.
 - A prefill/decode fleet needs `refit_timeout_s` to be set, and
-  `kv_lease_duration_s` of at least 1.5 times (`refit_timeout_s` + 60 s): a lease
+  `kv_lease_duration_s` of at least twice (`refit_timeout_s` + 60 s): a lease
   that ends during a refit lets a prefill engine free KV that a frozen decode
   engine has not read.
 - With NeMo-Gym, `vllm_cfg.expose_http_server` must be true.
