@@ -29,6 +29,24 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 
+try:
+    import orjson
+except ImportError:  # pragma: no cover - orjson is a NeMo RL dependency
+    orjson = None
+
+
+def _loads(raw: bytes | str) -> Any:
+    """Parse JSON. orjson is several times faster than json on long token lists."""
+    return orjson.loads(raw) if orjson is not None else json.loads(raw)
+
+
+def _dumps(value: Any) -> bytes:
+    """Serialize JSON to bytes, with orjson when it is installed."""
+    if orjson is not None:
+        return orjson.dumps(value)
+    return json.dumps(value).encode()
+
+
 _GYM_TOKEN_METADATA_FIELDS = (
     "prompt_token_ids",
     "generation_token_ids",
@@ -458,6 +476,46 @@ def _clamp_output_tokens_to_context(
             body[key] = remaining
 
 
+class DynamoTokenWrapperHost:
+    """Run one token wrapper server inside a Ray actor, with its own tokenizer.
+
+    The wrapper tokenizes every rollout request in Python. Hosted in the driver it
+    shares the driver's GIL, so several of these, each in its own process, are what
+    scales the rate of requests. Wrap the class with ``ray.remote`` to use it.
+    """
+
+    def __init__(
+        self,
+        *,
+        tokenizer_config: dict[str, Any],
+        dynamo_frontend_base_url: str,
+        tokenizer_chat_template_kwargs: Optional[dict[str, Any]],
+        exclude_tools_when_tool_choice_none: bool,
+        request_timeout_s: Optional[float],
+        max_model_len: Optional[int],
+    ) -> None:
+        from nemo_rl.algorithms.utils import get_tokenizer
+        from nemo_rl.utils.fastokens import maybe_patch_fastokens
+
+        maybe_patch_fastokens(bool(tokenizer_config.get("use_fastokens")))
+        self._server = DynamoTokenWrapperServer(
+            dynamo_frontend_base_url=dynamo_frontend_base_url,
+            tokenizer=get_tokenizer(tokenizer_config),
+            tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
+            exclude_tools_when_tool_choice_none=exclude_tools_when_tool_choice_none,
+            request_timeout_s=request_timeout_s,
+            max_model_len=max_model_len,
+        )
+
+    def start(self) -> str:
+        """Start the server and return its base URL."""
+        return self._server.start()
+
+    def shutdown(self) -> None:
+        """Stop the server."""
+        self._server.shutdown()
+
+
 class DynamoTokenWrapperServer:
     """Small HTTP server that supplies tokenized chat prompts to Dynamo."""
 
@@ -487,7 +545,7 @@ class DynamoTokenWrapperServer:
         import aiohttp
         import uvicorn
         from fastapi import FastAPI, HTTPException, Request
-        from fastapi.responses import JSONResponse
+        from fastapi.responses import JSONResponse, Response
 
         @asynccontextmanager
         async def lifespan(_: FastAPI):
@@ -518,10 +576,10 @@ class DynamoTokenWrapperServer:
             }
 
         @app.post("/v1/chat/completions")
-        async def chat_completions(request: Request) -> JSONResponse:
+        async def chat_completions(request: Request) -> Response:
             try:
-                request_body = await request.json()
-            except json.JSONDecodeError as e:
+                request_body = _loads(await request.body())
+            except ValueError as e:
                 raise HTTPException(status_code=400, detail="Invalid JSON body.") from e
             if not isinstance(request_body, dict):
                 raise HTTPException(
@@ -553,7 +611,13 @@ class DynamoTokenWrapperServer:
                         content={"error": {"message": str(e)}},
                         status_code=502,
                     )
-            return JSONResponse(content=response_body, status_code=status_code)
+            # Serialized here, once, as bytes: JSONResponse would run the stdlib
+            # encoder over the whole response on this event loop.
+            return Response(
+                content=_dumps(response_body),
+                status_code=status_code,
+                media_type="application/json",
+            )
 
         node_ip = _get_node_ip_local()
         free_port = _get_free_port_local(
@@ -596,16 +660,16 @@ class DynamoTokenWrapperServer:
         try:
             async with session.post(
                 url,
-                json=request_body,
+                data=_dumps(request_body),
                 headers=headers,
             ) as response:
-                response_text = await response.text()
-                if not response_text:
+                raw_response = await response.read()
+                if not raw_response:
                     return response.status, {}
                 try:
-                    response_body = json.loads(response_text)
-                except json.JSONDecodeError:
-                    response_body = {"raw": response_text}
+                    response_body = _loads(raw_response)
+                except ValueError:
+                    response_body = {"raw": raw_response.decode(errors="replace")}
                 if not isinstance(response_body, dict):
                     response_body = {"response": response_body}
                 return response.status, response_body

@@ -699,15 +699,15 @@ def test_forward_chat_completion_reuses_loop_bound_session() -> None:
         async def __aexit__(self, *args):
             return None
 
-        async def text(self):
-            return json.dumps({"choices": []})
+        async def read(self):
+            return json.dumps({"choices": []}).encode()
 
     class FakeSession:
         def __init__(self):
             self.calls = []
 
-        def post(self, url, *, json, headers):
-            self.calls.append((url, json, headers))
+        def post(self, url, *, data, headers):
+            self.calls.append((url, data, headers))
             return FakeResponse()
 
     server = DynamoTokenWrapperServer(
@@ -728,3 +728,76 @@ def test_forward_chat_completion_reuses_loop_bound_session() -> None:
 
     assert len(session.calls) == 2
     assert session.calls[1][2]["Authorization"] == "Bearer token"
+
+
+def test_forward_chat_completion_sends_json_bytes_and_parses_the_reply() -> None:
+    class FakeResponse:
+        status = 400
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def read(self):
+            return b'{"message": "too long", "code": 400}'
+
+    class FakeSession:
+        def __init__(self):
+            self.sent = None
+
+        def post(self, url, *, data, headers):
+            self.sent = data
+            return FakeResponse()
+
+    server = DynamoTokenWrapperServer(
+        dynamo_frontend_base_url="http://dynamo/v1",
+        tokenizer=_Tokenizer(),
+        tokenizer_chat_template_kwargs=None,
+        exclude_tools_when_tool_choice_none=True,
+        request_timeout_s=30,
+    )
+    session = FakeSession()
+    server._client_session = session
+
+    status, body = asyncio.run(
+        server._forward_chat_completion(
+            {"nvext": {"token_data": [1, 2, 3]}}, authorization=None
+        )
+    )
+
+    assert isinstance(session.sent, bytes)
+    assert json.loads(session.sent) == {"nvext": {"token_data": [1, 2, 3]}}
+    assert (status, body) == (400, {"message": "too long", "code": 400})
+
+
+def test_forward_chat_completion_keeps_a_reply_that_is_not_json() -> None:
+    class FakeResponse:
+        status = 502
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def read(self):
+            return b"upstream connect error"
+
+    class FakeSession:
+        def post(self, url, *, data, headers):
+            return FakeResponse()
+
+    server = DynamoTokenWrapperServer(
+        dynamo_frontend_base_url="http://dynamo/v1",
+        tokenizer=_Tokenizer(),
+        tokenizer_chat_template_kwargs=None,
+        exclude_tools_when_tool_choice_none=True,
+        request_timeout_s=30,
+    )
+    server._client_session = FakeSession()
+
+    status, body = asyncio.run(server._forward_chat_completion({}, authorization=None))
+
+    assert (status, body) == (502, {"raw": "upstream connect error"})
