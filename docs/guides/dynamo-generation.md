@@ -69,12 +69,11 @@ A Dynamo upgrade must update and reverify these coupled locations:
   `managed_runtime.py` counts, and vLLM's `kv_load_failure_policy` and
   `kv_lease_duration` settings
 - `nemo_rl/models/generation/vllm/patches.py`
-  (`_patch_vllm_pause_with_held_kv`): the text of
-  `Scheduler.has_finished_requests()` in the new vLLM release. The patch logs a
-  warning and does nothing when its anchor is missing, and a P/D refit then waits
-  for a KV lease. Run the `test_held_kv_pause_patch_*` tests against the new
-  release. Check also that vLLM still raises, and does not hang, when a cache clear
-  cannot free held KV, because the channel relies on never asking for it
+  (`_patch_vllm_pause_with_held_kv`, `_patch_vllm_reset_cache_with_held_kv`): the
+  text of `Scheduler.has_finished_requests()` and of the failure branch of
+  `Scheduler.reset_prefix_cache()` in the new vLLM release. A missing anchor stops
+  a prefill or decode worker at startup (`require_held_kv_patches`). Run the
+  `test_held_kv_*` tests against the new release
 - `nemo_rl/models/generation/dynamo/refit.py`: the `/engine/*` RL routes it
   posts to, which must still forward any `engine_rpc` to vLLM `collective_rpc`
   with the request body as keyword arguments
@@ -211,7 +210,7 @@ Two managed vLLM settings keep disaggregation robust across refits:
   them, and decode does not check before it reads, so it can use wrong KV without
   an error. The lease must outlast the pause. Setup requires at least twice
   `dynamo_cfg.control_timeout_s`, which covers a refit and a rollback. The
-  SingleController also requires at least twice
+  SingleController also requires at least 1.5 times
   (`refit_timeout_s` + 60 s). The cost of a long lease is that KV from a lost
   handoff stays allocated on the prefill engine until the lease ends.
 
@@ -229,7 +228,7 @@ weight versions, which is what `max_trajectory_age_steps > 1` relies on.
 All engines pause at the same time, prefill and decode alike, and resume decode
 first. The pause is short because NeMo RL patches the installed vLLM so that a
 `keep` pause does not wait for KV that a prefill engine holds for decode (see
-[the design document](../design-docs/dynamo-integration.md#vllm-source-patch)).
+[the design document](../design-docs/dynamo-integration.md#vllm-source-patches)).
 The same pause serves the [SingleController](#run-under-the-singlecontroller).
 
 With `in_flight_weight_updates: false` the collector instead waits for every
@@ -238,29 +237,28 @@ active trajectory to finish before the refit, as before.
 `grpo.async_grpo.recompute_kv_cache_after_weight_updates` controls the cache:
 
 - `true`: each engine clears its KV and prefix caches while paused, so kept
-  requests recompute their KV on the new weights.
+  requests recompute their KV on the new weights. This works with in-flight
+  updates on an aggregated and on a prefill/decode fleet. On a prefill/decode
+  fleet a second vLLM patch drops the cached prefix hashes while KV stays held
+  (see [the design document](../design-docs/dynamo-integration.md#vllm-source-patches)).
+  One request class keeps old-weight KV: a request that was between prefill and
+  decode at the refit.
 - `false`: kept requests continue with the KV they computed on the old weights.
-
-Setup rejects the one combination vLLM cannot do: in-flight updates with
-`recompute_kv_cache_after_weight_updates: true` on a disaggregated fleet. Clearing
-the cache preempts running requests, which vLLM cannot do for a decode request
-that is waiting on remote KV from a prefill engine. Use `false` there, as the
-disaggregated example does.
 
 Operational notes:
 
 - Requests stay open while the fleet is paused, so `dynamo_cfg.request_timeout_s`
   must exceed the longest refit.
 - `dynamo_cfg.control_timeout_s` bounds each pause and resume call.
-- On a prefill/decode fleet the channel rejects a `wait` pause and any cache
-  clear before it sends a request. See the
+- On a prefill/decode fleet the channel rejects a `wait` pause before it sends a
+  request. See the
   [design document](../design-docs/dynamo-integration.md#pausing-around-a-refit).
 - A pause that fails on any engine resumes every engine, including the one that
   failed, and raises, so a failed refit never leaves the fleet frozen.
 - Old-weight KV continues under the new weights after the refit, and so does a
   chunked prefill that was frozen in the middle of a prompt. This is the usual
-  in-flight behavior. Set `recompute_kv_cache_after_weight_updates: true` on an
-  aggregated fleet to recompute it.
+  in-flight behavior. Set `recompute_kv_cache_after_weight_updates: true` to
+  recompute the cached KV.
 - Check the vLLM patch on every vLLM upgrade. Without it, the pause of a
   prefill engine waits for a KV lease and a P/D refit can fail.
 
@@ -368,9 +366,10 @@ sbatch \
 ```
 
 This assigns one GPU to training, one to a TP1 decode engine, and one to a TP1
-prefill engine, and refits in flight without clearing caches. The Dynamo L1 job
+prefill engine, and refits in flight and clears the caches. The Dynamo L1 job
 runs the two-GPU aggregated smokes, and a three-GPU SingleController smoke with a
-prefill/decode fleet (`tests/functional/grpo_dynamo_single_controller_disagg.sh`). The P/D smoke runs in the H100 nightly suite
+prefill/decode fleet (`tests/functional/grpo_dynamo_single_controller_disagg.sh`).
+The P/D smoke runs in the H100 nightly suite
 through
 `tests/test_suites/llm/grpo-qwen3-0.6b-1n8g-dtensor2tp1-dynamo-disagg.sh`, which
 allocates one eight-GPU node and leaves five GPUs unused. Both smokes verify
@@ -405,14 +404,13 @@ Limits on this path:
 - `async_rl.generation_fleet_health.enabled` must stay false, because the
   Dynamo frontend owns request routing. Its `refit_timeout_s` is honored: the
   worker extension in each engine enforces it.
-- `async_rl.recompute_kv_cache_after_weight_updates` must be false: the refit
-  pause does not clear the caches, because a prefill/decode fleet cannot.
 - `dynamo_cfg.request_timeout_s` must be greater than
   `async_rl.generation_fleet_health.refit_timeout_s`. Requests stay open while the
   engines are frozen.
 - A prefill/decode fleet needs `refit_timeout_s` to be set, and
-  `kv_lease_duration_s` of at least twice (`refit_timeout_s` + 60 s): the
-  SingleController retries a failed refit once while the engines stay paused.
+  `kv_lease_duration_s` of at least 1.5 times (`refit_timeout_s` + 60 s): a lease
+  that ends during a refit lets a prefill engine free KV that a frozen decode
+  engine has not read.
 - With NeMo-Gym, `vllm_cfg.expose_http_server` must be true.
   `token_capture` and `async_rl.generation_router` are not supported.
 - `vllm_cfg.enable_vllm_metrics_logger` must be false; only the legacy GRPO loop

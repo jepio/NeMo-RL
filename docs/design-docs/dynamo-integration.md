@@ -38,8 +38,9 @@ blocks when the lease ends, whether or not decode has read them, and a decode
 engine does not check the lease before it reads. A lease that ends first can
 therefore make decode use freed memory and wrong KV without an error. The lease
 must outlast the pause: setup requires at least twice `control_timeout_s`, and the
-SingleController requires at least twice (`refit_timeout_s` + 60 s), because it
-retries a failed refit once while the engines stay paused. A long lease only keeps
+SingleController requires at least 1.5 times (`refit_timeout_s` + 60 s). A decode
+engine heartbeats every lease/6, so up to a sixth of the lease is spent when a
+pause starts, and a rollback adds a resume. A long lease only keeps
 the KV of a lost handoff allocated for longer.
 
 Startup completes only after the frontend sees the same fixed membership at
@@ -113,25 +114,26 @@ pause:
 - **In-flight refit** (`DynamoGeneration.pause_generation_for_refit` for the async
   GRPO loop, `drain_for_weight_update` for the SingleController): `keep` mode. The
   scheduler stops stepping and keeps its requests. They continue on the new
-  weights after `resume_generation`. The SingleController never clears the caches.
-  The async loop clears them only on an aggregated fleet with
-  `recompute_kv_cache_after_weight_updates`.
+  weights after `resume_generation`. With
+  `recompute_kv_cache_after_weight_updates` the same pause also clears the KV and
+  prefix caches, on an aggregated and on a prefill/decode fleet. The
+  SingleController hook `drain_for_weight_update(clear_cache=...)` returns True
+  when the backend cleared the caches, and the SingleController then skips its own
+  `invalidate_kv_cache` call.
 - **Idle fleet** (`flush_cache`, after the async collector has drained every
-  trajectory): `wait` mode with a cache clear.
+  trajectory): `wait` mode with a cache clear on an aggregated fleet, and `keep`
+  mode with a cache clear on a prefill/decode fleet.
 
 All engines pause at the same time and resume decode first. The decode engines
 send the heartbeats that extend the KV leases, and a resumed prefill engine
 expires the leases that ended, so prefill must not resume first.
 
-Two rules protect a prefill/decode fleet, and the channel enforces both with a
-`ValueError` before it sends any request:
-
-- No cache clear. A prefill engine still holds KV for the decode engines, and
-  vLLM raises when a clear cannot free it.
-- No `wait` pause. A decode engine in `PAUSED_NEW` runs no waiting-request loop, so
-  it admits no request that waits for remote KV. The pause of a prefill engine then
-  waits for decode to admit its whole backlog, a time that grows with the backlog
-  and the generation length and can exceed `control_timeout_s`.
+One rule protects a prefill/decode fleet, and the channel enforces it with a
+`ValueError` before it sends any request: no `wait` pause. A decode engine in
+`PAUSED_NEW` runs no waiting-request loop, so it admits no request that waits for
+remote KV. The pause of a prefill engine then waits for decode to admit its whole
+backlog, a time that grows with the backlog and the generation length and can
+exceed `control_timeout_s`.
 
 If a pause fails on any engine, the channel resumes every engine before it
 raises, including the engine that failed, because a pause call that timed out can
@@ -141,8 +143,11 @@ the same reason. A failed refit therefore never leaves part of the fleet frozen.
 
 `finish_generation()`, which the async trainers call after validation while
 rollouts can still be in flight, posts Dynamo's `flush_cache` route to every
-engine. This resets the prefix cache without a pause. vLLM keeps the blocks that a
-running request or a held lease still uses, so the reset can be partial. With
+engine. This resets the prefix cache without a pause. The reset is all or nothing:
+while a running request or a held lease still uses a block, vLLM skips the whole
+reset and logs a warning, and the route still reports success. The reset therefore
+only keeps the prefix cache free of one phase of generation, and it does not
+protect against old-weight KV. The refit pause does that. With
 `in_flight_weight_updates` off, the async collector drains its own trajectories
 instead and refits an idle fleet.
 
@@ -150,9 +155,15 @@ A request stays open while the engines are frozen, so `request_timeout_s` must
 exceed the refit time. The SingleController checks this against its refit
 deadline.
 
-### vLLM source patch
+### vLLM source patches
 
-A pause in `keep` mode completes only when the engine core is idle. vLLM 0.29
+Two patches in `nemo_rl/models/generation/vllm/patches.py` let a pause and a cache
+clear finish on a prefill/decode fleet. `DynamoVllmWorker` calls
+`require_held_kv_patches()` when its role is not `aggregated`, and a missing
+anchor stops the worker at startup instead of stalling a refit later.
+
+**Pause with held KV** (`_patch_vllm_pause_with_held_kv`). A pause in `keep` mode
+completes only when the engine core is idle. vLLM 0.29
 counts a prefill engine's finished requests as work while it holds their KV for a
 decode engine (`Scheduler.has_finished_requests()`). A paused decode engine pulls
 nothing, so the pause of a prefill engine waits for the KV lease. NeMo RL patches
@@ -165,9 +176,25 @@ blocks stay allocated. The paused prefill engine is idle, so it handles no
 notification and expires no lease until it resumes. The patch does not change
 `PAUSED_NEW`.
 
+**Cache clear with held KV** (`_patch_vllm_reset_cache_with_held_kv`). A pause with
+`clear_cache` ends in `Scheduler.reset_prefix_cache(reset_running_requests=True)`.
+That call preempts the running requests and then needs every block free, but a
+prefill engine holds the KV of finished requests and a decode engine holds the
+blocks of requests that wait for remote KV. Stock vLLM raises "Failed to reset KV
+cache" then. With a KV connector the patch instead drops every cached prefix hash
+and leaves the blocks in use alone. The holders still read valid blocks, and the
+blocks stop being cacheable, so no new request hits KV from the old weights.
+Without a connector vLLM raises as before.
+
+One request class keeps old-weight KV: a request that was between prefill and
+decode when the refit ran. Its blocks are valid for its own decode, and vLLM
+registers loaded blocks in the prefix cache again when the remote load ends, so a
+later request can hit them. The effect is bounded by the number of such requests
+and by the prefix-cache eviction, and it has not been measured.
+
 TensorRT-LLM needs no such patch: each of its engines refits itself at a
-scheduler step boundary and never waits for KV transfers. The patch applies to
-vLLM 0.29.0 and has to be checked on each upgrade; vLLM main has the same code
+scheduler step boundary and never waits for KV transfers. The patches apply to
+vLLM 0.29.0 and have to be checked on each upgrade; vLLM main has the same code
 today. A refit that needs no pause at all is a possible alternative. The refit is
 one collective RPC that the engine core runs between steps. It has not been tested
 on GPUs.
@@ -182,6 +209,10 @@ have not run on hardware:
   refit.
 - A resumed decode engine heartbeats before the prefill engine expires a lease.
 - A refit contends with NIXL traffic for network bandwidth.
+- A pause with `clear_cache` completes on a prefill/decode fleet, the prefix cache
+  then reports no hit for old-weight prompts, and decode output stays coherent.
+- The number of requests that are between prefill and decode at a refit, and so
+  keep old-weight KV, is small.
 - NeMo-Gym under the SingleController sends no request before the first refit.
 
 ## Dependencies
