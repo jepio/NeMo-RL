@@ -19,9 +19,11 @@ import pytest
 from transformers import AutoTokenizer
 
 from nemo_rl.models.generation.dynamo.token_wrapper import (
+    DYNAMO_SESSION_ID_HEADER,
     DynamoTokenWrapperServer,
     _inject_gym_token_metadata,
     _validate_engine_data,
+    pop_gym_conversation_id,
     prepare_dynamo_chat_completion_request,
 )
 
@@ -801,3 +803,61 @@ def test_forward_chat_completion_keeps_a_reply_that_is_not_json() -> None:
     status, body = asyncio.run(server._forward_chat_completion({}, authorization=None))
 
     assert (status, body) == (502, {"raw": "upstream connect error"})
+
+
+def test_pop_gym_conversation_id_removes_the_non_openai_field() -> None:
+    body = {"messages": [], "conversation_params": {"conversation_id": " abc-123 "}}
+
+    assert pop_gym_conversation_id(body) == "abc-123"
+    assert "conversation_params" not in body
+
+
+@pytest.mark.parametrize(
+    "params", [None, {}, {"conversation_id": ""}, {"conversation_id": None}, "x"]
+)
+def test_pop_gym_conversation_id_ignores_a_missing_or_blank_id(params) -> None:
+    body = {"messages": []} if params is None else {"conversation_params": params}
+
+    assert pop_gym_conversation_id(body) is None
+    assert "conversation_params" not in body
+
+
+def test_forward_chat_completion_sends_the_session_as_a_dynamo_header() -> None:
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def read(self):
+            return b"{}"
+
+    class FakeSession:
+        def __init__(self):
+            self.headers = []
+
+        def post(self, url, *, data, headers):
+            self.headers.append(headers)
+            return FakeResponse()
+
+    server = DynamoTokenWrapperServer(
+        dynamo_frontend_base_url="http://dynamo/v1",
+        tokenizer=_Tokenizer(),
+        tokenizer_chat_template_kwargs=None,
+        exclude_tools_when_tool_choice_none=True,
+        request_timeout_s=30,
+    )
+    session = FakeSession()
+    server._client_session = session
+
+    async def forward_both():
+        await server._forward_chat_completion({}, authorization=None, session_id="s1")
+        await server._forward_chat_completion({}, authorization=None)
+
+    asyncio.run(forward_both())
+
+    assert session.headers[0][DYNAMO_SESSION_ID_HEADER] == "s1"
+    assert DYNAMO_SESSION_ID_HEADER not in session.headers[1]

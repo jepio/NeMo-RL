@@ -35,6 +35,29 @@ except ImportError:  # pragma: no cover - orjson is a NeMo RL dependency
     orjson = None
 
 
+# The HTTP header that Dynamo's frontend turns into the session of a request. The
+# router binds a session to one worker when session affinity is on
+# (``--router-session-affinity-ttl-secs``), so every turn of a rollout reaches the
+# engine that holds its prefix.
+DYNAMO_SESSION_ID_HEADER = "x-dynamo-session-id"
+
+
+def pop_gym_conversation_id(request_body: dict[str, Any]) -> Optional[str]:
+    """Remove NeMo-Gym's ``conversation_params`` from the body and return its id.
+
+    Gym adds ``conversation_params.conversation_id``, a TensorRT-LLM extension that
+    is not part of the OpenAI schema, when ``forward_session_id_as_conversation_id``
+    is on. Dynamo takes the session as a header instead, so the field must not go on.
+    """
+    params = request_body.pop("conversation_params", None)
+    if not isinstance(params, dict):
+        return None
+    conversation_id = params.get("conversation_id")
+    if isinstance(conversation_id, (str, int)) and str(conversation_id).strip():
+        return str(conversation_id).strip()
+    return None
+
+
 def _loads(raw: bytes | str) -> Any:
     """Parse JSON. orjson is several times faster than json on long token lists."""
     return orjson.loads(raw) if orjson is not None else json.loads(raw)
@@ -599,9 +622,11 @@ class DynamoTokenWrapperServer:
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
 
+            session_id = pop_gym_conversation_id(prepared_body)
             status_code, response_body = await self._forward_chat_completion(
                 prepared_body,
                 authorization=request.headers.get("authorization"),
+                session_id=session_id,
             )
             if 200 <= status_code < 300:
                 try:
@@ -646,6 +671,7 @@ class DynamoTokenWrapperServer:
         request_body: dict[str, Any],
         *,
         authorization: Optional[str],
+        session_id: Optional[str] = None,
     ) -> tuple[int, dict[str, Any]]:
         import aiohttp
 
@@ -653,6 +679,8 @@ class DynamoTokenWrapperServer:
         headers = {"Content-Type": "application/json"}
         if authorization:
             headers["Authorization"] = authorization
+        if session_id:
+            headers[DYNAMO_SESSION_ID_HEADER] = session_id
 
         session = self._client_session
         if session is None:
