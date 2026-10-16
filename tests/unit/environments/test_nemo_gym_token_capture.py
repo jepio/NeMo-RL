@@ -516,3 +516,42 @@ def test_setup_nemo_gym_config_megatron_keeps_async_rollout_check_satisfied() ->
     assert mcore_cfg["expose_http_server"] is True
     assert "async_engine" not in mcore_cfg
     assert should_use_nemo_gym(config) is True
+
+
+def test_setup_nemo_gym_config_exposes_the_dynamo_server() -> None:
+    """Managed Dynamo serves the OpenAI API through the same vllm_cfg flags."""
+    from nemo_rl.algorithms.grpo import MasterConfig
+    from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
+
+    config = MasterConfig.model_construct(
+        env={"should_use_nemo_gym": True},
+        policy={
+            "generation": {
+                "backend": "dynamo",
+                "vllm_cfg": {"async_engine": False, "expose_http_server": False},
+                "stop_strings": ["stop"],
+                "stop_token_ids": [1],
+            }
+        },
+    )
+
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    generation = config.policy["generation"]
+    assert generation["vllm_cfg"]["async_engine"] is True
+    assert generation["vllm_cfg"]["expose_http_server"] is True
+    assert generation["stop_strings"] is None
+    assert generation["stop_token_ids"] is None
+
+
+def test_setup_nemo_gym_config_rejects_other_backends() -> None:
+    from nemo_rl.algorithms.grpo import MasterConfig
+    from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
+
+    config = MasterConfig.model_construct(
+        env={"should_use_nemo_gym": True},
+        policy={"generation": {"backend": "sglang"}},
+    )
+
+    with pytest.raises(ValueError, match="vllm, dynamo, or megatron"):
+        setup_nemo_gym_config(config, tokenizer=None)
