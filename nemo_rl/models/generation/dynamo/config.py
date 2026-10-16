@@ -187,6 +187,11 @@ class DynamoCfg(BaseModel, extra="forbid"):
     request_timeout_s: PositiveFloat
     control_timeout_s: PositiveFloat
     disaggregation: DynamoDisaggregationConfig | None = None
+    # Token wrapper processes that serve NeMo-Gym. One runs as a thread of the driver
+    # and shares its GIL, which caps it at tens of requests per second on long SWE
+    # prompts. More than one runs each as its own Ray actor, spread over the cluster,
+    # with a tokenizer of its own and its own URL.
+    token_wrapper_workers: PositiveInt = 1
     worker_args: DynamoWorkerArgs
     frontend_args: DynamoFrontendArgs
     metrics_include_prefixes: list[str] | None

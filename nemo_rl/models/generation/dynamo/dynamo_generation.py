@@ -32,7 +32,10 @@ from nemo_rl.models.generation.dynamo.http_client import (
 from nemo_rl.models.generation.dynamo.managed_runtime import ManagedDynamoRuntime
 from nemo_rl.models.generation.dynamo.metrics import DynamoMetricsSampler
 from nemo_rl.models.generation.dynamo.refit import DynamoRefitChannel
-from nemo_rl.models.generation.dynamo.token_wrapper import DynamoTokenWrapperServer
+from nemo_rl.models.generation.dynamo.token_wrapper import (
+    DynamoTokenWrapperHost,
+    DynamoTokenWrapperServer,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
@@ -284,6 +287,7 @@ class DynamoGeneration(GenerationInterface):
             config=self.cfg,
         )
         self._token_wrapper_server: Optional[DynamoTokenWrapperServer] = None
+        self._token_wrapper_actors: list[Any] = []
         self._dynamo_frontend_base_url = ""
         self.dp_openai_server_base_urls: list[Optional[str]] = []
         self._refit_channel: DynamoRefitChannel | None = None
@@ -302,9 +306,8 @@ class DynamoGeneration(GenerationInterface):
             self._configure_mtp_drafter()
 
             if expose_http_server:
-                self._token_wrapper_server = DynamoTokenWrapperServer(
+                wrapper_kwargs = dict(
                     dynamo_frontend_base_url=url,
-                    tokenizer=tokenizer,
                     tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
                     exclude_tools_when_tool_choice_none=(
                         dynamo_cfg.worker_args.exclude_tools_when_tool_choice_none
@@ -312,11 +315,27 @@ class DynamoGeneration(GenerationInterface):
                     request_timeout_s=dynamo_cfg.request_timeout_s,
                     max_model_len=int(self.cfg["vllm_cfg"]["max_model_len"]),
                 )
-                wrapper_url = self._token_wrapper_server.start()
-                self.dp_openai_server_base_urls = [wrapper_url]
+                if dynamo_cfg.token_wrapper_workers == 1:
+                    self._token_wrapper_server = DynamoTokenWrapperServer(
+                        tokenizer=tokenizer, **wrapper_kwargs
+                    )
+                    wrapper_urls = [self._token_wrapper_server.start()]
+                else:
+                    if tokenizer_config is None:
+                        raise RuntimeError(
+                            "dynamo_cfg.token_wrapper_workers > 1 needs the "
+                            "tokenizer config, so that each wrapper process can "
+                            "build its own tokenizer."
+                        )
+                    wrapper_urls = self._start_token_wrapper_actors(
+                        dynamo_cfg.token_wrapper_workers,
+                        tokenizer_config=dict(tokenizer_config),
+                        **wrapper_kwargs,
+                    )
+                self.dp_openai_server_base_urls = wrapper_urls
                 print(
-                    "  [Dynamo] Forwarding rollout chat requests through token "
-                    f"wrapper {wrapper_url} -> {url}",
+                    f"  [Dynamo] Forwarding rollout chat requests through "
+                    f"{len(wrapper_urls)} token wrapper(s) {wrapper_urls} -> {url}",
                     flush=True,
                 )
             else:
@@ -393,6 +412,20 @@ class DynamoGeneration(GenerationInterface):
             raise RuntimeError("Dynamo refit channel is unavailable")
         return channel
 
+    def _start_token_wrapper_actors(self, count: int, **host_kwargs: Any) -> list[str]:
+        """Start ``count`` token wrapper actors, spread over the cluster.
+
+        Returns:
+            The base URL of each wrapper. Gym balances its requests over them, as it
+            does over the per-engine servers of the vLLM backend.
+        """
+        host_cls = ray.remote(num_cpus=1)(DynamoTokenWrapperHost)
+        self._token_wrapper_actors = [
+            host_cls.options(scheduling_strategy="SPREAD").remote(**host_kwargs)
+            for _ in range(count)
+        ]
+        return ray.get([actor.start.remote() for actor in self._token_wrapper_actors])
+
     def shutdown(self) -> bool:
         """Stop process-local helpers and any driver-owned managed runtime."""
         sampler = self._metrics_sampler
@@ -402,6 +435,17 @@ class DynamoGeneration(GenerationInterface):
                 sampler.shutdown()
             except Exception:
                 LOGGER.exception("Failed to stop the Dynamo metrics sampler")
+        wrapper_actors = self._token_wrapper_actors
+        self._token_wrapper_actors = []
+        for actor in wrapper_actors:
+            try:
+                ray.get(actor.shutdown.remote(), timeout=30)
+            except Exception:
+                LOGGER.exception("Failed to stop a Dynamo token wrapper actor")
+            try:
+                ray.kill(actor)
+            except Exception:
+                LOGGER.exception("Failed to kill a Dynamo token wrapper actor")
         token_wrapper_server = self._token_wrapper_server
         self._token_wrapper_server = None
         if token_wrapper_server is not None:
@@ -452,6 +496,7 @@ class DynamoGeneration(GenerationInterface):
             raise RuntimeError("Pickled DynamoGeneration has no frontend URL.")
         self._dynamo_frontend_base_url = frontend_url
         self._token_wrapper_server = None
+        self._token_wrapper_actors = []
         self._managed_runtime = None
         self._metrics_sampler = None
         self._refit_channel = state["_refit_channel"]

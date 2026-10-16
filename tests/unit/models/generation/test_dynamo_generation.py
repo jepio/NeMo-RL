@@ -14,6 +14,7 @@
 
 import asyncio
 import pickle
+import types
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -327,6 +328,69 @@ def test_token_wrapper_is_used_for_nemo_gym(monkeypatch) -> None:
     # Dynamo rejects a request whose output does not fit the context, so the wrapper
     # needs the engines' context length to shorten it.
     assert wrappers[0].kwargs["max_model_len"] == 5
+
+
+def test_several_token_wrappers_run_as_actors_with_their_own_urls(monkeypatch) -> None:
+    _patch_runtime(monkeypatch)
+    created: list[dict] = []
+    killed: list[object] = []
+
+    class FakeActor:
+        def __init__(self, kwargs, index):
+            self.kwargs = kwargs
+            self.index = index
+            self.start = types.SimpleNamespace(remote=lambda: f"url{index}")
+            self.shutdown = types.SimpleNamespace(remote=lambda: "stopped")
+
+    class FakeHostClass:
+        def options(self, **options):
+            created.append({"options": options})
+            return self
+
+        def remote(self, **kwargs):
+            created[-1]["kwargs"] = kwargs
+            return FakeActor(kwargs, len(created) - 1)
+
+    fake_ray = types.SimpleNamespace(
+        remote=lambda **_: (lambda cls: FakeHostClass()),
+        get=lambda value, **_: value,
+        kill=killed.append,
+    )
+    monkeypatch.setattr(generation_module, "ray", fake_ray)
+    config = _config(expose_http_server=True)
+    config["dynamo_cfg"]["token_wrapper_workers"] = 3
+
+    generation = DynamoGeneration(
+        cluster=object(),
+        config=config,
+        tokenizer=object(),
+        tokenizer_config={"name": "Qwen/Qwen3-0.6B", "use_fastokens": True},
+    )
+
+    # Gym gets one URL per wrapper, and each actor builds its own tokenizer.
+    assert generation.dp_openai_server_base_urls == ["url0", "url1", "url2"]
+    assert len(created) == 3
+    assert all(c["options"] == {"scheduling_strategy": "SPREAD"} for c in created)
+    assert created[0]["kwargs"]["tokenizer_config"] == {
+        "name": "Qwen/Qwen3-0.6B",
+        "use_fastokens": True,
+    }
+    assert created[0]["kwargs"]["max_model_len"] == 5
+
+    generation.shutdown()
+
+    assert len(killed) == 3
+
+
+def test_several_token_wrappers_need_the_tokenizer_config(monkeypatch) -> None:
+    _patch_runtime(monkeypatch)
+    config = _config(expose_http_server=True)
+    config["dynamo_cfg"]["token_wrapper_workers"] = 2
+
+    with pytest.raises(RuntimeError, match="tokenizer config"):
+        DynamoGeneration(
+            cluster=object(), config=config, tokenizer=object(), tokenizer_config=None
+        )
 
 
 def test_collective_refit_drives_the_worker_extension_and_survives_pickling(
