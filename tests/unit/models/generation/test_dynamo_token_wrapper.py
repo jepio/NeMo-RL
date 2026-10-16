@@ -653,9 +653,40 @@ def test_inject_gym_token_metadata_validates_and_populates_message() -> None:
         "generation_log_probs": [-0.25, -0.5],
     }
 
-    response["nvext"]["engine_data"]["completion_logprobs"] = [-0.25]
+    # The IDs live on the message now, so the response does not carry them twice.
+    assert "engine_data" not in response["nvext"]
+
+    response["nvext"]["engine_data"] = {
+        "prompt_token_ids": [1, 2, 3],
+        "completion_token_ids": [4, 5],
+        "completion_logprobs": [-0.25],
+    }
     with pytest.raises(ValueError, match="1 generation log probabilities for 2"):
         _inject_gym_token_metadata(response)
+    # A response that fails validation keeps its engine data for the error report.
+    assert "engine_data" in response["nvext"]
+
+
+def test_prepare_request_does_not_modify_the_request_it_receives() -> None:
+    import copy
+
+    tokenizer = _Tokenizer()
+    messages = _tool_conversation()
+    body = {
+        "model": "dummy-model",
+        "messages": messages,
+        "nvext": {"extra_fields": ["timing"]},
+        "required_prefix_token_ids": [1],
+    }
+    before = copy.deepcopy(body)
+
+    prepare_dynamo_chat_completion_request(
+        body,
+        tokenizer=tokenizer,
+        exclude_tools_when_tool_choice_none=True,
+    )
+
+    assert body == before
 
 
 def test_forward_chat_completion_reuses_loop_bound_session() -> None:

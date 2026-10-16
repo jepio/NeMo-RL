@@ -40,6 +40,11 @@ _TOOL_ARGUMENT_MAPPING_ERROR = "Can only get item pairs from a mapping."
 def _coerce_token_id_list(value: Any, field_name: str) -> list[int]:
     if not isinstance(value, list):
         raise ValueError(f"{field_name} must be a list of token IDs.")
+    # A prompt of tens of thousands of IDs arrives on every request, and the common
+    # case needs no conversion. The check runs in C, while the loop below holds the GIL
+    # for every element.
+    if set(map(type, value)) <= {int}:
+        return value
     try:
         return [int(token_id) for token_id in value]
     except (TypeError, ValueError) as e:
@@ -58,11 +63,23 @@ def _coerce_logprob_list(value: Any, field_name: str) -> list[float]:
 
 
 def _strip_gym_token_metadata(messages: list[Any]) -> list[Any]:
-    stripped_messages = deepcopy(messages)
-    for message in stripped_messages:
-        if isinstance(message, dict):
-            for field in _GYM_TOKEN_METADATA_FIELDS:
-                message.pop(field, None)
+    """Return the messages without the token metadata that Gym attached.
+
+    Only a message that carries metadata is copied, and the copy is shallow. A deep
+    copy of a long conversation, with the token lists of its latest turn, held the
+    GIL for a third of the wrapper's time.
+    """
+    stripped_messages = []
+    for message in messages:
+        if isinstance(message, dict) and any(
+            field in message for field in _GYM_TOKEN_METADATA_FIELDS
+        ):
+            message = {
+                key: value
+                for key, value in message.items()
+                if key not in _GYM_TOKEN_METADATA_FIELDS
+            }
+        stripped_messages.append(message)
     return stripped_messages
 
 
@@ -297,6 +314,11 @@ def _inject_gym_token_metadata(response_body: dict[str, Any]) -> None:
     message["prompt_token_ids"] = prompt_token_ids
     message["generation_token_ids"] = generation_token_ids
     message["generation_log_probs"] = generation_logprobs
+    # The same IDs now sit on the message. Keeping engine_data would carry the whole
+    # prompt twice through the response, and through every JSON pass after this one.
+    nvext = response_body.get("nvext")
+    if isinstance(nvext, dict):
+        nvext.pop("engine_data", None)
 
 
 def prepare_dynamo_chat_completion_request(
@@ -335,14 +357,15 @@ def prepare_dynamo_chat_completion_request(
     if not isinstance(messages, list):
         raise ValueError("Dynamo token wrapper requires chat-completion messages.")
 
-    prepared_body = deepcopy(request_body)
+    # Shallow copy: only top-level keys of the copy change below.
+    prepared_body = dict(request_body)
     stripped_messages = _strip_gym_token_metadata(messages)
     prepared_body["messages"] = stripped_messages
     prepared_body.pop("required_prefix_token_ids", None)
 
     required_prefix_token_ids = _derive_required_prefix_token_ids(messages)
     add_generation_prompt = _request_add_generation_prompt(prepared_body)
-    template_messages = deepcopy(stripped_messages)
+    template_messages = stripped_messages
     assistant_index: int | None = None
     if required_prefix_token_ids is not None:
         assistant_index = _latest_tokenized_assistant_index(messages)
@@ -367,6 +390,9 @@ def prepare_dynamo_chat_completion_request(
     except TypeError as e:
         if str(e) != _TOOL_ARGUMENT_MAPPING_ERROR:
             raise
+        # The normalization rewrites tool calls in place, and the request that goes to
+        # Dynamo must keep its OpenAI payload, so it works on a private copy.
+        template_messages = deepcopy(stripped_messages)
         _normalize_tool_arguments_for_template(
             template_messages, before_index=len(template_messages)
         )
