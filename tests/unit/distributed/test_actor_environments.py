@@ -31,6 +31,9 @@ import pytest
 from nemo_rl.distributed.actor_environments import ACTOR_ENVIRONMENTS, _build_stage
 from nemo_rl.distributed.ray_actor_environment_registry import (
     ACTOR_ENVIRONMENT_REGISTRY,
+    DYNAMO_WORKER_FQN,
+    PREBUILT_DYNAMO_PY_EXECUTABLE_ENV,
+    _use_prebuilt_dynamo_executable,
 )
 from nemo_rl.distributed.virtual_cluster import (
     PY_EXECUTABLES,
@@ -290,3 +293,39 @@ def test_script_skips_by_extra_not_by_name():
         "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
         in listed
     )
+
+
+def test_dynamo_worker_fqn_is_a_registered_actor():
+    assert DYNAMO_WORKER_FQN in ACTOR_ENVIRONMENTS
+
+
+def test_prebuilt_dynamo_executable_replaces_only_the_dynamo_worker(tmp_path):
+    python = tmp_path / "python"
+    python.write_text("#!/bin/sh\n")
+    python.chmod(0o755)
+    registry = {DYNAMO_WORKER_FQN: "uv run --locked --extra dynamo", "other": "uv"}
+
+    _use_prebuilt_dynamo_executable(
+        registry, {PREBUILT_DYNAMO_PY_EXECUTABLE_ENV: str(python)}
+    )
+
+    assert registry == {DYNAMO_WORKER_FQN: str(python), "other": "uv"}
+
+
+def test_prebuilt_dynamo_executable_is_optional():
+    registry = {DYNAMO_WORKER_FQN: "uv run --locked --extra dynamo"}
+
+    _use_prebuilt_dynamo_executable(registry, {})
+    _use_prebuilt_dynamo_executable(registry, {PREBUILT_DYNAMO_PY_EXECUTABLE_ENV: ""})
+
+    assert registry == {DYNAMO_WORKER_FQN: "uv run --locked --extra dynamo"}
+
+
+def test_prebuilt_dynamo_executable_must_exist(tmp_path):
+    registry = {DYNAMO_WORKER_FQN: "uv run --locked --extra dynamo"}
+
+    with pytest.raises(ValueError, match="is not an executable file"):
+        _use_prebuilt_dynamo_executable(
+            registry, {PREBUILT_DYNAMO_PY_EXECUTABLE_ENV: str(tmp_path / "missing")}
+        )
+    assert registry == {DYNAMO_WORKER_FQN: "uv run --locked --extra dynamo"}

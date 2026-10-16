@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import tomllib
+from collections.abc import Mapping
 from pathlib import Path
 
 from nemo_rl.distributed.actor_environments import ACTOR_ENVIRONMENTS
@@ -33,6 +35,41 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     actor_fqn: PY_EXECUTABLES.SYSTEM if extras is None else uv_py_executable(extras)
     for actor_fqn, extras in ACTOR_ENVIRONMENTS.items()
 }
+
+# The managed Dynamo worker needs its own vLLM and ai-dynamo, which cannot share the
+# training interpreter. An image that sets NEMO_RL_PY_EXECUTABLES_SYSTEM=1 for every
+# other actor can still prebuild that environment, and name its interpreter here.
+DYNAMO_WORKER_FQN = "nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker"
+PREBUILT_DYNAMO_PY_EXECUTABLE_ENV = "NEMO_RL_DYNAMO_PY_EXECUTABLE"
+
+
+def _use_prebuilt_dynamo_executable(
+    registry: dict[str, str], environ: Mapping[str, str]
+) -> None:
+    """Point the Dynamo worker at a prebuilt interpreter when the image names one.
+
+    Args:
+        registry: Actor FQN to py_executable, changed in place.
+        environ: The environment to read ``NEMO_RL_DYNAMO_PY_EXECUTABLE`` from.
+
+    Raises:
+        ValueError: If the variable names a file that is not an executable. A
+            silent fallback would launch the Dynamo worker in the training
+            interpreter, which has no ai-dynamo.
+    """
+    python = environ.get(PREBUILT_DYNAMO_PY_EXECUTABLE_ENV)
+    if not python:
+        return
+    if not (os.path.isfile(python) and os.access(python, os.X_OK)):
+        raise ValueError(
+            f"{PREBUILT_DYNAMO_PY_EXECUTABLE_ENV}={python!r} is not an executable "
+            "file. Build the `dynamo` extra's venv into the image and name its "
+            "python, or unset the variable to build the actor venv with uv."
+        )
+    registry[DYNAMO_WORKER_FQN] = python
+
+
+_use_prebuilt_dynamo_executable(ACTOR_ENVIRONMENT_REGISTRY, os.environ)
 
 
 def _reject_undeclared_extras() -> None:

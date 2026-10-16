@@ -50,6 +50,13 @@ every other actor venv. etcd and nats-server are looked up in
 `NEMO_RL_DYNAMO_BIN_DIR=$PWD/bin bash docker/install_dynamo_services.sh`
 installs them.
 
+An image that runs every other actor on the system interpreter
+(`NEMO_RL_PY_EXECUTABLES_SYSTEM=1`) can still run the Dynamo worker in its own
+prebuilt venv: build the `dynamo` extra into that venv and set
+`NEMO_RL_DYNAMO_PY_EXECUTABLE` to its `python`. The registry then uses that
+interpreter for `DynamoVllmWorker` only, and raises an error at import when the
+path is not an executable file.
+
 A Dynamo upgrade must update and reverify these coupled locations:
 
 - root `pyproject.toml` and `uv.lock`: the `ai-dynamo` and
