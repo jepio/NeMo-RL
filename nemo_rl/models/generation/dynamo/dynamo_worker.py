@@ -92,6 +92,19 @@ def _env_with_fp8_defaults(
     return env
 
 
+def _env_with_nixl_defaults(base_env: dict[str, str]) -> dict[str, str]:
+    """Apply the engine environment that a prefill or decode engine needs.
+
+    vLLM's NIXL connector moves the conv state of Mamba-style layers (Gated
+    DeltaNet in Qwen3.5, for example) only in the dim-first ``DS`` layout, and a
+    worker that finds another layout stops at startup. A model without such layers
+    ignores the variable. A value that the process already has wins.
+    """
+    env = dict(base_env)
+    env.setdefault("VLLM_SSM_CONV_STATE_LAYOUT", "DS")
+    return env
+
+
 @ray.remote(num_cpus=0)
 class DynamoGpuReservation:  # pragma: no cover
     """Hold one placement-group GPU while a sibling actor owns the engine."""
@@ -247,8 +260,11 @@ class DynamoVllmWorker:  # pragma: no cover
                     "VLLM_NIXL_SIDE_CHANNEL_PORT": str(nixl_port),
                 }
             )
+        base_env = _env_with_fp8_defaults(dict(os.environ), engine_env_defaults)
+        if nixl_port is not None:
+            base_env = _env_with_nixl_defaults(base_env)
         worker_env = build_managed_worker_env(
-            base_env=_env_with_fp8_defaults(dict(os.environ), engine_env_defaults),
+            base_env=base_env,
             configured_env=configured_env,
             manager_env=managed_worker_env,
         )

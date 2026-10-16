@@ -610,6 +610,20 @@ def test_fp8_defaults_do_not_override_an_explicit_e8m0_setting(
     assert env["PATH"] == "/bin"
 
 
+def test_nixl_defaults_select_the_dim_first_conv_state_layout() -> None:
+    env = dynamo_worker_module._env_with_nixl_defaults({"PATH": "/bin"})
+
+    assert env == {"PATH": "/bin", "VLLM_SSM_CONV_STATE_LAYOUT": "DS"}
+
+
+def test_nixl_defaults_keep_an_explicit_conv_state_layout() -> None:
+    env = dynamo_worker_module._env_with_nixl_defaults(
+        {"VLLM_SSM_CONV_STATE_LAYOUT": "SD"}
+    )
+
+    assert env["VLLM_SSM_CONV_STATE_LAYOUT"] == "SD"
+
+
 def test_shutdown_guards_each_owned_resource_independently(monkeypatch) -> None:
     runtime = ManagedDynamoRuntime(cluster=_Cluster(), config=_config())
     runtime._frontend_process = object()

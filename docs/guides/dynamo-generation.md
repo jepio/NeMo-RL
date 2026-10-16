@@ -208,6 +208,19 @@ NIXL uses UCX by default, so set UCX variables such as `UCX_TLS` and
 transfer can use CUDA transport; cross-node transfer requires a working NIXL
 UCX/RDMA path and is not qualified when it falls back to TCP.
 
+Two environment requirements showed up on GB300 NVL72 with Qwen3.5:
+
+- A model with Mamba-style layers (Gated DeltaNet) needs
+  `VLLM_SSM_CONV_STATE_LAYOUT=DS` in prefill and decode engines, or the NIXL
+  connector stops them at startup with "3-read Mamba conv transfer requires DS
+  conv state layout". NeMo RL sets it by default for the engines of a
+  disaggregated fleet, and a value in the environment wins.
+- Use one UCX in each engine process. NIXL wheels from PyPI bundle their own UCX. In
+  an image that also ships HPC-X UCX, the wheel's UCX can load HPC-X's CUDA module,
+  fail to register it, and report "UCX CUDA support was not found" with
+  `NIXL_ERR_BACKEND` when it registers the KV cache. Build the Dynamo venv without
+  the PyPI NIXL and link the image's NIXL, which is built against the image's UCX.
+
 Two managed vLLM settings keep disaggregation robust across refits:
 
 - `kv_load_failure_policy: recompute`: when a decode engine cannot pull KV from
