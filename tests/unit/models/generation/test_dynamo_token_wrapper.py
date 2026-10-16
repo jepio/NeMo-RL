@@ -194,6 +194,59 @@ def test_prepare_dynamo_chat_completion_request_first_turn() -> None:
     }
 
 
+@pytest.mark.parametrize("key", ["max_completion_tokens", "max_tokens"])
+def test_prepare_dynamo_chat_completion_request_clamps_output_to_the_context(
+    key,
+) -> None:
+    # The prompt is two tokens. Dynamo answers 400 when prompt and output together
+    # exceed the context length, and the vLLM server shortens the output instead.
+    prepared = prepare_dynamo_chat_completion_request(
+        {"messages": [{"role": "user", "content": "hello"}], key: 65536},
+        tokenizer=_Tokenizer(),
+        exclude_tools_when_tool_choice_none=True,
+        max_model_len=100,
+    )
+
+    assert prepared[key] == 98
+    assert prepared["nvext"]["token_data"] == [10, 99]
+
+
+def test_prepare_dynamo_chat_completion_request_keeps_a_request_that_fits() -> None:
+    body = {
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_completion_tokens": 50,
+    }
+
+    prepared = prepare_dynamo_chat_completion_request(
+        body,
+        tokenizer=_Tokenizer(),
+        exclude_tools_when_tool_choice_none=True,
+        max_model_len=100,
+    )
+    unbounded = prepare_dynamo_chat_completion_request(
+        {**body, "max_completion_tokens": 65536},
+        tokenizer=_Tokenizer(),
+        exclude_tools_when_tool_choice_none=True,
+    )
+
+    assert prepared["max_completion_tokens"] == 50
+    assert "max_tokens" not in prepared
+    # Without a context length nothing is clamped.
+    assert unbounded["max_completion_tokens"] == 65536
+
+
+def test_prepare_dynamo_chat_completion_request_rejects_a_prompt_that_fills_the_context() -> (
+    None
+):
+    with pytest.raises(ValueError, match="maximum context length is 2 tokens"):
+        prepare_dynamo_chat_completion_request(
+            {"messages": [{"role": "user", "content": "hello"}]},
+            tokenizer=_Tokenizer(),
+            exclude_tools_when_tool_choice_none=True,
+            max_model_len=2,
+        )
+
+
 def test_public_qwen3_tokenizer_first_turn_matches_chat_template(
     tiny_qwen3_model_path,
 ) -> None:

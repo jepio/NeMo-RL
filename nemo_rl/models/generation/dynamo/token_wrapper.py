@@ -305,8 +305,25 @@ def prepare_dynamo_chat_completion_request(
     tokenizer: Any,
     tokenizer_chat_template_kwargs: Optional[dict[str, Any]] = None,
     exclude_tools_when_tool_choice_none: bool,
+    max_model_len: Optional[int] = None,
 ) -> dict[str, Any]:
-    """Prepare a NeMo-Gym chat-completion request for Dynamo token input."""
+    """Prepare a NeMo-Gym chat-completion request for Dynamo token input.
+
+    Args:
+        request_body: The chat-completion request that NeMo-Gym sends.
+        tokenizer: Renders the chat template into prompt token ids.
+        tokenizer_chat_template_kwargs: Default chat-template arguments.
+        exclude_tools_when_tool_choice_none: Drop tools from the prompt when
+            ``tool_choice`` is ``none``.
+        max_model_len: The engines' context length. Dynamo rejects a request with
+            HTTP 400 when the prompt plus the requested output exceeds it, while the
+            vLLM server shortens the output to fit. When set, the output limit is
+            lowered to the room that is left, as the vLLM server does.
+
+    Raises:
+        ValueError: If the request cannot be prepared, or the prompt alone does not
+            fit in ``max_model_len``.
+    """
     if request_body.get("stream"):
         raise ValueError("Dynamo native token wrapper does not support stream=True.")
 
@@ -388,7 +405,31 @@ def prepare_dynamo_chat_completion_request(
     nvext["token_data"] = full_prompt_token_ids
     prepared_body["nvext"] = nvext
 
+    if max_model_len is not None:
+        _clamp_output_tokens_to_context(
+            prepared_body,
+            prompt_tokens=len(full_prompt_token_ids),
+            max_model_len=max_model_len,
+        )
+
     return prepared_body
+
+
+def _clamp_output_tokens_to_context(
+    body: dict[str, Any], *, prompt_tokens: int, max_model_len: int
+) -> None:
+    """Lower the requested output length to what the context length leaves."""
+    remaining = max_model_len - prompt_tokens
+    if remaining < 1:
+        raise ValueError(
+            f"This model's maximum context length is {max_model_len} tokens. "
+            f"However, your request has {prompt_tokens} input tokens. "
+            "Please reduce the length of the input messages."
+        )
+    for key in ("max_completion_tokens", "max_tokens"):
+        requested = body.get(key)
+        if requested is not None and int(requested) > remaining:
+            body[key] = remaining
 
 
 class DynamoTokenWrapperServer:
@@ -402,12 +443,14 @@ class DynamoTokenWrapperServer:
         tokenizer_chat_template_kwargs: Optional[dict[str, Any]],
         exclude_tools_when_tool_choice_none: bool,
         request_timeout_s: Optional[float],
+        max_model_len: Optional[int] = None,
     ) -> None:
         self.dynamo_frontend_base_url = dynamo_frontend_base_url
         self.tokenizer = tokenizer
         self.tokenizer_chat_template_kwargs = tokenizer_chat_template_kwargs
         self.exclude_tools_when_tool_choice_none = exclude_tools_when_tool_choice_none
         self.request_timeout_s = request_timeout_s
+        self.max_model_len = max_model_len
         self.base_url: Optional[str] = None
         self.server: Any = None
         self.thread: Optional[threading.Thread] = None
@@ -467,6 +510,7 @@ class DynamoTokenWrapperServer:
                     tokenizer=self.tokenizer,
                     tokenizer_chat_template_kwargs=self.tokenizer_chat_template_kwargs,
                     exclude_tools_when_tool_choice_none=self.exclude_tools_when_tool_choice_none,
+                    max_model_len=self.max_model_len,
                 )
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e

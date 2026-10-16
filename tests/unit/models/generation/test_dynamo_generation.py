@@ -324,6 +324,9 @@ def test_token_wrapper_is_used_for_nemo_gym(monkeypatch) -> None:
     )
     assert generation.dp_openai_server_base_urls == ["http://127.0.0.1:3001/v1"]
     assert wrappers[0].kwargs["tokenizer"] is tokenizer
+    # Dynamo rejects a request whose output does not fit the context, so the wrapper
+    # needs the engines' context length to shorten it.
+    assert wrappers[0].kwargs["max_model_len"] == 5
 
 
 def test_collective_refit_drives_the_worker_extension_and_survives_pickling(
