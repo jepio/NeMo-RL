@@ -779,3 +779,72 @@ def test_redaction_hides_credentials() -> None:
         "HF_TOKEN": "<redacted>",
         "NCCL_DEBUG": "INFO",
     }
+
+
+def test_data_parallel_attention_adds_the_data_parallel_size_and_expert_parallelism() -> (
+    None
+):
+    vllm_cfg = {
+        **_config()["vllm_cfg"],
+        "tensor_parallel_size": 1,
+        "data_parallel_size": 4,
+        "expert_parallel_size": 4,
+    }
+    argv = build_dynamo_vllm_argv(
+        model_name="model",
+        namespace="nemo-rl-1",
+        seed=7,
+        vllm_cfg=vllm_cfg,
+        vllm_kwargs={},
+        dynamo_cfg=DynamoCfg.model_validate(_dynamo_cfg()),
+        worker_role="aggregated",
+        kv_event_port=None,
+    )
+
+    assert _flag_value(argv, "--data-parallel-size") == "4"
+    assert _flag_value(argv, "--tensor-parallel-size") == "1"
+    assert "--enable-expert-parallel" in argv
+    single = build_dynamo_vllm_argv(
+        model_name="model",
+        namespace="nemo-rl-1",
+        seed=7,
+        vllm_cfg=_config()["vllm_cfg"],
+        vllm_kwargs={},
+        dynamo_cfg=DynamoCfg.model_validate(_dynamo_cfg()),
+        worker_role="aggregated",
+        kv_event_port=None,
+    )
+    assert "--data-parallel-size" not in single
+
+
+def test_data_parallel_config_derives_world_size_and_checks_expert_parallelism() -> (
+    None
+):
+    config = _config()
+    config["vllm_cfg"].update(
+        {"tensor_parallel_size": 1, "data_parallel_size": 4, "expert_parallel_size": 4}
+    )
+    assert DynamoConfig.model_validate(config).engine_world_size == 4
+
+    config["vllm_cfg"]["expert_parallel_size"] = 2
+    with pytest.raises(
+        ValidationError, match="tensor_parallel_size \\* data_parallel_size"
+    ):
+        DynamoConfig.model_validate(config)
+    config["vllm_cfg"]["expert_parallel_size"] = 1
+    with pytest.raises(ValidationError, match="data_parallel_size > 1"):
+        DynamoConfig.model_validate(config)
+
+
+def test_data_parallel_size_is_managed_in_vllm_kwargs() -> None:
+    with pytest.raises(ValueError, match="managed option"):
+        build_dynamo_vllm_argv(
+            model_name="model",
+            namespace="nemo-rl-1",
+            seed=7,
+            vllm_cfg=_config()["vllm_cfg"],
+            vllm_kwargs={"data_parallel_size": 2},
+            dynamo_cfg=DynamoCfg.model_validate(_dynamo_cfg()),
+            worker_role="aggregated",
+            kv_event_port=None,
+        )

@@ -262,6 +262,12 @@ def build_dynamo_vllm_argv(
         if value is not None:
             builder.add(flag, value, source=f"vllm_cfg.{key}")
 
+    if int(vllm_cfg.get("data_parallel_size") or 1) > 1:
+        builder.add(
+            "--data-parallel-size",
+            int(vllm_cfg["data_parallel_size"]),
+            source="vllm_cfg.data_parallel_size",
+        )
     if int(vllm_cfg["expert_parallel_size"]) > 1:
         builder.add(
             "--enable-expert-parallel",

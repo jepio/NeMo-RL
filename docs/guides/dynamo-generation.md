@@ -240,8 +240,19 @@ GPU count is:
 A TP times PP engine that does not fit on one node must use whole nodes: TP8
 needs two four-GPU nodes, and a larger expert-parallel group lets each GPU hold
 fewer experts. Its first node runs the leader and the other nodes run headless
-workers. Prefill and decode engines may be on different nodes. NeMo RL starts decode engines first and then prefill
-engines. This gives every engine a stable NCCL refit rank.
+workers. Prefill and decode engines may be on different nodes. NeMo RL starts
+decode engines first and then prefill engines. This gives every engine a stable
+NCCL refit rank.
+
+For a model with few KV heads, tensor parallelism replicates the KV cache: every
+GPU still stores and reads the KV of each sequence. Set
+`vllm_cfg.data_parallel_size` to use attention data parallelism instead. Each of
+the `data_parallel_size` ranks holds the attention weights and the full KV cache
+of its own sequences, and the experts are sharded over
+`tensor_parallel_size * data_parallel_size` ranks, so `expert_parallel_size` must
+equal that product. The engine then has `tp * pp * dp` ranks, and all of them
+must fit on one node. A TP1, DP4, EP4 engine stores each token once instead of
+twice (TP4) and reads it once per step.
 
 NeMo RL manages `--disaggregation-mode`, the NIXL connector, NIXL side-channel
 ports, and prefill KV-event ports. Do not set these values in

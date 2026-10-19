@@ -771,6 +771,7 @@ def test_fixed_pool_tracks_worker_before_metadata_failure(monkeypatch) -> None:
         manager_env={},
         startup_timeout_s=5,
         nodes_per_engine=1,
+        data_parallel_size=1,
     )
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.worker_pool.DynamoGpuReservation",
@@ -866,6 +867,7 @@ def test_fixed_pool_launches_all_workers_before_waiting_for_model_metadata(
         manager_env={},
         startup_timeout_s=5,
         nodes_per_engine=1,
+        data_parallel_size=1,
     )
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.worker_pool.DynamoGpuReservation",
@@ -988,6 +990,7 @@ def test_fixed_pool_scopes_ports_per_node_while_roles_stay_fleet_global(
         manager_env={},
         startup_timeout_s=5,
         nodes_per_engine=1,
+        data_parallel_size=1,
     )
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.worker_pool.DynamoGpuReservation",
@@ -1347,6 +1350,7 @@ def test_fixed_pool_starts_a_leader_and_headless_followers_for_a_multi_node_engi
         manager_env={},
         startup_timeout_s=5,
         nodes_per_engine=2,
+        data_parallel_size=1,
     )
     base = "nemo_rl.models.generation.dynamo.worker_pool"
     monkeypatch.setattr(f"{base}.DynamoGpuReservation", ReservationFactory)
@@ -1420,3 +1424,90 @@ def test_fixed_pool_splits_placement_groups_into_whole_node_engines() -> None:
         pool._engine_node_groups(groups[:3])
     with pytest.raises(ValueError, match="uses all 4 GPUs"):
         pool._engine_node_groups([SimpleNamespace(bundle_count=2)] * 4)
+
+
+def test_runtime_runs_data_parallel_attention_inside_one_node_only() -> None:
+    config = _config(tp=1)
+    config["vllm_cfg"]["data_parallel_size"] = 4
+    config["vllm_cfg"]["expert_parallel_size"] = 4
+    runtime = ManagedDynamoRuntime(cluster=_Cluster(), config=config)
+    assert runtime._engine_world_size == 4
+    assert runtime._data_parallel_size == 4
+    assert runtime._nodes_per_engine == 1
+
+    config["vllm_cfg"]["data_parallel_size"] = 8
+    config["vllm_cfg"]["expert_parallel_size"] = 8
+    with pytest.raises(ValueError, match="inside one node only"):
+        ManagedDynamoRuntime(cluster=_EightGpuCluster(), config=config)
+
+
+def test_fixed_pool_gives_each_data_parallel_engine_its_own_port_range(
+    monkeypatch,
+) -> None:
+    reservations = iter(
+        _FakeReservation(
+            metadata={"node_ip": "10.0.0.1", "gpu_id": gpu}, system_port=4001 + gpu
+        )
+        for gpu in range(4)
+    )
+    workers_to_launch = iter(
+        [
+            _FakeWorker(metadata={"instance_id": "w0"}),
+            _FakeWorker(metadata={"instance_id": "w1"}),
+        ]
+    )
+    launch_kwargs = []
+
+    class RemoteFactory:
+        def __init__(self, actor, record=None):
+            self.actor = actor
+            self.record = record
+
+        def remote(self, *args, **kwargs):
+            if self.record is not None:
+                self.record.append(kwargs)
+            return self.actor
+
+    class ReservationFactory:
+        @staticmethod
+        def options(**kwargs):
+            return RemoteFactory(next(reservations))
+
+    class WorkerFactory:
+        @staticmethod
+        def options(**kwargs):
+            return RemoteFactory(next(workers_to_launch), launch_kwargs)
+
+    class Cluster:
+        @staticmethod
+        def get_placement_groups():
+            return [SimpleNamespace(bundle_count=4)]
+
+    pool = FixedDynamoWorkerPool(
+        cluster=Cluster(),
+        config=_config(),
+        namespace="nemo-rl-test",
+        engine_world_size=2,
+        worker_roles=["decode", "prefill"],
+        manager_env={},
+        startup_timeout_s=5,
+        nodes_per_engine=1,
+        data_parallel_size=2,
+    )
+    base = "nemo_rl.models.generation.dynamo.worker_pool"
+    monkeypatch.setattr(f"{base}.DynamoGpuReservation", ReservationFactory)
+    monkeypatch.setattr(f"{base}.DynamoVllmWorker", WorkerFactory)
+    monkeypatch.setattr(
+        f"{base}.make_actor_runtime_env",
+        lambda _fqn: {"py_executable": "python", "env_vars": {}},
+    )
+    monkeypatch.setattr(
+        f"{base}.PlacementGroupSchedulingStrategy", lambda **kwargs: kwargs
+    )
+    monkeypatch.setattr(f"{base}.ray.get", lambda refs, **kwargs: refs)
+
+    pool.start()
+
+    # Two engines of two data-parallel ranks share one node: ports never overlap.
+    assert [kwargs["nixl_port"] for kwargs in launch_kwargs] == [4100, 4102]
+    assert [kwargs["kv_event_port"] for kwargs in launch_kwargs] == [None, 4202]

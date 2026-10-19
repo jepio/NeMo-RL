@@ -42,6 +42,7 @@ DynamoWorkerRole = Literal["aggregated", "decode", "prefill"]
 _VLLM_CFG_STRUCTURAL = {
     "env_vars",
     "expert_parallel_size",
+    "data_parallel_size",
 }
 
 _VLLM_CFG_MOVED = {
@@ -95,7 +96,6 @@ _VLLM_CFG_INAPPLICABLE = {
 }
 
 _VLLM_SINGLE_RANK_ONLY_FIELDS = {
-    "data_parallel_size",
     "decode_context_parallel_size",
     "prefill_context_parallel_size",
 }
@@ -236,6 +236,10 @@ class DynamoVllmConfig(BaseModel, extra="allow"):
     tensor_parallel_size: PositiveInt
     pipeline_parallel_size: PositiveInt
     expert_parallel_size: PositiveInt
+    # Attention data parallelism: each of these ranks holds the attention weights
+    # and the KV cache of its own sequences, and experts are sharded over
+    # data_parallel_size x tensor_parallel_size ranks.
+    data_parallel_size: PositiveInt = 1
     gpu_memory_utilization: float
     max_model_len: PositiveInt
     kv_cache_dtype: str
@@ -249,10 +253,18 @@ class DynamoVllmConfig(BaseModel, extra="allow"):
 
     @model_validator(mode="after")
     def _validate_parallelism_and_precision(self) -> "DynamoVllmConfig":
-        if self.expert_parallel_size not in (1, self.tensor_parallel_size):
+        if self.expert_parallel_size not in (
+            1,
+            self.tensor_parallel_size * self.data_parallel_size,
+        ):
             raise ValueError(
                 "backend='dynamo' requires expert_parallel_size to be 1 or "
-                "equal tensor_parallel_size"
+                "equal tensor_parallel_size * data_parallel_size"
+            )
+        if self.data_parallel_size > 1 and self.expert_parallel_size == 1:
+            raise ValueError(
+                "backend='dynamo' requires expert_parallel_size = tensor_parallel_size "
+                "* data_parallel_size when data_parallel_size > 1"
             )
         if self.precision not in {"bfloat16", "fp8"}:
             raise ValueError(
@@ -341,8 +353,12 @@ class DynamoConfig(BaseModel, extra="allow"):
 
     @property
     def engine_world_size(self) -> int:
-        """Return the derived ranks in each single-node vLLM engine."""
-        return self.vllm_cfg.tensor_parallel_size * self.vllm_cfg.pipeline_parallel_size
+        """Return the derived ranks in each vLLM engine."""
+        return (
+            self.vllm_cfg.tensor_parallel_size
+            * self.vllm_cfg.pipeline_parallel_size
+            * self.vllm_cfg.data_parallel_size
+        )
 
     @property
     def managed_worker_count(self) -> int | None:

@@ -50,10 +50,10 @@ def _vllm_port_for_node_slot(node_slot: int) -> int:
 def _nixl_port_for_node_slot(node_slot: int) -> int:
     """Return the managed node-local NIXL side-channel port.
 
-    One port per engine group is enough for vLLM 0.29: its NIXL scheduler
-    serves every TP rank's handshake from one listener on
-    ``VLLM_NIXL_SIDE_CHANNEL_PORT + data_parallel_index``, and managed engines
-    run with DP=1.
+    One port per data-parallel rank of an engine group is enough for vLLM 0.29:
+    its NIXL scheduler serves every TP rank's handshake from one listener on
+    ``VLLM_NIXL_SIDE_CHANNEL_PORT + data_parallel_index``. The pool advances the
+    node slot by the data-parallel size, so engines on one node never share a port.
     """
     port = DEFAULT_DYNAMO_NIXL_PORT_RANGE_LOW + node_slot
     if port >= DEFAULT_DYNAMO_NIXL_PORT_RANGE_HIGH:
@@ -101,12 +101,14 @@ class FixedDynamoWorkerPool:
         manager_env: dict[str, str],
         startup_timeout_s: float,
         nodes_per_engine: int,
+        data_parallel_size: int,
     ) -> None:
         self._cluster = cluster
         self._config = config
         self._namespace = namespace
         self._engine_world_size = engine_world_size
         self._nodes_per_engine = nodes_per_engine
+        self._data_parallel_size = data_parallel_size
         self._worker_roles = tuple(worker_roles)
         if not self._worker_roles:
             raise ValueError("Managed Dynamo requires at least one worker role.")
@@ -285,7 +287,9 @@ class FixedDynamoWorkerPool:
             for node_rank, plan in enumerate(node_plans):
                 node_ip = plan["node_ip"]
                 node_slot = engine_slots_by_node.get(node_ip, 0)
-                engine_slots_by_node[node_ip] = node_slot + 1
+                # A data-parallel engine uses one NIXL and KV-event port per rank,
+                # counted up from the port of its slot.
+                engine_slots_by_node[node_ip] = node_slot + self._data_parallel_size
                 system_ports = system_ports_by_node.setdefault(node_ip, set())
                 system_port = ray.get(
                     plan["reservations"][0].select_free_port.remote(

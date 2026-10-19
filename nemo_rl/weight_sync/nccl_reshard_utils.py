@@ -840,10 +840,12 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
                 "for a vLLM destination with nccl_reshard refit "
                 f"(got {train_etp})."
             )
-        if gen_ep != 1 and gen_ep != gen_tp:
+        gen_dp = vllm_cfg.get("data_parallel_size", 1)
+        if gen_ep != 1 and gen_ep != gen_tp * gen_dp:
             violations.append(
                 "policy.generation.vllm_cfg.expert_parallel_size must be 1 or "
-                f"equal to tensor_parallel_size (got ep={gen_ep}, tp={gen_tp})."
+                "equal to tensor_parallel_size * data_parallel_size "
+                f"(got ep={gen_ep}, tp={gen_tp}, dp={gen_dp})."
             )
         if gen_pp != 1:
             violations.append(
