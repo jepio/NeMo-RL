@@ -16,6 +16,7 @@
 
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from nemo_rl.models.generation.dynamo.config import (
@@ -24,7 +25,28 @@ from nemo_rl.models.generation.dynamo.config import (
     DynamoWorkerRole,
 )
 
+
+@dataclass(frozen=True)
+class MultiNodeEngine:
+    """The place of one node in a vLLM engine that spans several nodes.
+
+    Node rank 0 is the leader: it serves Dynamo endpoints and starts the engine
+    core. Every other node runs ``dynamo.vllm --headless``, which starts vLLM
+    workers only and joins the leader at ``master_addr:master_port``.
+    """
+
+    nnodes: int
+    node_rank: int
+    master_addr: str
+    master_port: int
+
+
 _MANAGED_FLAGS = {
+    "--nnodes",
+    "--node-rank",
+    "--master-addr",
+    "--master-port",
+    "--headless",
     "--component",
     "--disaggregation-mode",
     "--model-name",
@@ -136,13 +158,26 @@ def build_dynamo_vllm_argv(
     dynamo_cfg: DynamoCfg,
     worker_role: DynamoWorkerRole,
     kv_event_port: int | None,
+    multi_node: MultiNodeEngine | None = None,
 ) -> list[str]:
     """Build a conflict-free ``python -m dynamo.vllm`` argument list.
 
     ``kv_event_port`` must be set for ``prefill`` workers and must be ``None``
-    for ``decode`` and ``aggregated`` workers.
+    for ``decode`` and ``aggregated`` workers. ``multi_node`` is set for each
+    node of an engine whose TP x PP ranks span several nodes.
     """
     builder = _ArgvBuilder()
+    if multi_node is not None:
+        builder.add("--nnodes", multi_node.nnodes, source="managed multi-node")
+        builder.add("--node-rank", multi_node.node_rank, source="managed multi-node")
+        builder.add(
+            "--master-addr", multi_node.master_addr, source="managed multi-node"
+        )
+        builder.add(
+            "--master-port", multi_node.master_port, source="managed multi-node"
+        )
+        if multi_node.node_rank > 0:
+            builder.add("--headless", source="managed multi-node")
     builder.add("--model", model_name, source="managed runtime")
     builder.add("--served-model-name", model_name, source="managed runtime")
     builder.add("--namespace", namespace, source="managed runtime")

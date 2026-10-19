@@ -237,8 +237,10 @@ GPU count is:
 (prefill_workers + decode_workers) * tensor_parallel_size * pipeline_parallel_size
 ```
 
-Each TP times PP engine must fit on one node. Prefill and decode engines may be
-on different nodes. NeMo RL starts decode engines first and then prefill
+A TP times PP engine that does not fit on one node must use whole nodes: TP8
+needs two four-GPU nodes, and a larger expert-parallel group lets each GPU hold
+fewer experts. Its first node runs the leader and the other nodes run headless
+workers. Prefill and decode engines may be on different nodes. NeMo RL starts decode engines first and then prefill
 engines. This gives every engine a stable NCCL refit rank.
 
 NeMo RL manages `--disaggregation-mode`, the NIXL connector, NIXL side-channel

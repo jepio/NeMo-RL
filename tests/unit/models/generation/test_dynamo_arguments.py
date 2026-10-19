@@ -20,6 +20,7 @@ from pydantic import ValidationError
 
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.dynamo.arguments import (
+    MultiNodeEngine,
     build_dynamo_frontend_argv,
     build_dynamo_vllm_argv,
     build_managed_worker_env,
@@ -478,6 +479,61 @@ def test_disaggregated_role_kwargs_replace_shared_engine_kwargs_per_role() -> No
     assert _flag_value(prefill_argv, "--max-num-seqs") == "128"
     assert _flag_value(decode_argv, "--max-num-batched-tokens") == "16384"
     assert _flag_value(decode_argv, "--max-num-seqs") == "64"
+
+
+def test_multi_node_engine_argv_marks_the_leader_and_the_headless_nodes() -> None:
+    common = {
+        "model_name": "model",
+        "namespace": "nemo-rl-1",
+        "seed": 7,
+        "vllm_cfg": _config()["vllm_cfg"],
+        "vllm_kwargs": {},
+        "dynamo_cfg": DynamoCfg.model_validate(_dynamo_cfg()),
+        "worker_role": "aggregated",
+        "kv_event_port": None,
+    }
+    leader = build_dynamo_vllm_argv(
+        **common,
+        multi_node=MultiNodeEngine(
+            nnodes=2, node_rank=0, master_addr="10.0.0.1", master_port=4001
+        ),
+    )
+    follower = build_dynamo_vllm_argv(
+        **common,
+        multi_node=MultiNodeEngine(
+            nnodes=2, node_rank=1, master_addr="10.0.0.1", master_port=4001
+        ),
+    )
+    single = build_dynamo_vllm_argv(**common)
+
+    for argv, rank in ((leader, "0"), (follower, "1")):
+        assert _flag_value(argv, "--nnodes") == "2"
+        assert _flag_value(argv, "--node-rank") == rank
+        assert _flag_value(argv, "--master-addr") == "10.0.0.1"
+        assert _flag_value(argv, "--master-port") == "4001"
+    assert "--headless" not in leader
+    assert "--headless" in follower
+    assert "--nnodes" not in single
+    assert "--headless" not in single
+
+
+@pytest.mark.parametrize(
+    "flag", ["--nnodes", "--node-rank", "--master-addr", "--master-port", "--headless"]
+)
+def test_multi_node_flags_are_managed(flag) -> None:
+    dynamo_cfg = _dynamo_cfg()
+    dynamo_cfg["worker_args"]["extra_cli_args"] = [flag, "1"]
+    with pytest.raises(ValueError, match="managed option"):
+        build_dynamo_vllm_argv(
+            model_name="model",
+            namespace="nemo-rl-1",
+            seed=7,
+            vllm_cfg=_config()["vllm_cfg"],
+            vllm_kwargs={},
+            dynamo_cfg=DynamoCfg.model_validate(dynamo_cfg),
+            worker_role="aggregated",
+            kv_event_port=None,
+        )
 
 
 def test_aggregated_worker_ignores_disaggregation_role_kwargs() -> None:

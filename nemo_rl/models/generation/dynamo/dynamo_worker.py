@@ -29,6 +29,7 @@ import ray
 
 from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
 from nemo_rl.models.generation.dynamo.arguments import (
+    MultiNodeEngine,
     build_dynamo_vllm_argv,
     build_managed_worker_env,
     redact_argv,
@@ -184,8 +185,12 @@ class DynamoVllmWorker:  # pragma: no cover
         startup_timeout_s: float,
         seed: int,
         cleanup_reservation: ray.actor.ActorHandle,
+        multi_node: MultiNodeEngine | None = None,
     ) -> None:
         self._group_name = group_name
+        # A node that is not the first of a multi-node engine runs vLLM workers
+        # only. It has no Dynamo endpoint to wait for.
+        self._headless = multi_node is not None and multi_node.node_rank > 0
         self._node_ip = _get_node_ip_local()
         self._system_port = system_port
         self._vllm_port = vllm_port
@@ -277,6 +282,7 @@ class DynamoVllmWorker:  # pragma: no cover
             dynamo_cfg=dynamo_cfg,
             worker_role=worker_role,
             kv_event_port=kv_event_port,
+            multi_node=multi_node,
         )
         self._validate_argv(
             dynamo_python,
@@ -304,7 +310,8 @@ class DynamoVllmWorker:  # pragma: no cover
             ray.get(
                 cleanup_reservation.register_process_group.remote(self._process.pid)
             )
-            self._wait_for_system_port(startup_timeout_s)
+            if not self._headless:
+                self._wait_for_system_port(startup_timeout_s)
         except Exception:
             self._stop_process()
             raise

@@ -2,16 +2,22 @@
 
 The managed Dynamo backend owns a fixed vLLM fleet inside the Ray allocation.
 It is deliberately narrower than Dynamo itself: there is no external-runtime,
-Kubernetes, DGD, multi-node engine-group, or non-vLLM mode.
+Kubernetes, DGD, data-parallel engine, or non-vLLM mode.
 
 ## Ownership and placement
 
 Constructing `ManagedDynamoRuntime` is inert. Its explicit `start()` method
 allocates ports, launches etcd and NATS JetStream, creates one Ray-managed
-`dynamo.vllm` process per model-parallel group, and starts the frontend. A
-worker group must fit on one node. Its world size is derived from vLLM tensor
-parallelism times pipeline parallelism; expert parallelism must be either one
-or equal to tensor parallelism.
+`dynamo.vllm` process per model-parallel group, and starts the frontend. Its
+world size is derived from vLLM tensor parallelism times pipeline parallelism;
+expert parallelism must be either one or equal to tensor parallelism. A group
+that does not fit on one node must use whole nodes, for example TP8 on two
+four-GPU nodes. The first node runs the leader, which serves the Dynamo
+endpoints and the refit routes. Every other node runs a headless `dynamo.vllm`
+that hosts vLLM workers only, and joins the leader through vLLM's multiprocessing
+backend (`--nnodes`, `--node-rank`, `--master-addr`, `--master-port`). All nodes
+of one engine use the seed of the leader. The refit addresses the leader only, and
+vLLM's own collective RPC reaches the ranks on the other nodes.
 
 Aggregated mode creates one homogeneous backend fleet from all inference GPU
 groups. Disaggregated mode creates fixed decode and prefill pools. The pools

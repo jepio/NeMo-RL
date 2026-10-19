@@ -24,6 +24,7 @@ import pytest
 
 from nemo_rl.models.generation.dynamo import dynamo_worker as dynamo_worker_module
 from nemo_rl.models.generation.dynamo import venv as dynamo_venv
+from nemo_rl.models.generation.dynamo.arguments import MultiNodeEngine
 from nemo_rl.models.generation.dynamo.dynamo_worker import (
     DynamoGpuReservation,
     DynamoVllmWorker,
@@ -178,8 +179,31 @@ def test_runtime_construction_is_inert_and_namespace_is_driver_owned(
         _ = runtime.frontend_url
 
 
-def test_runtime_rejects_multinode_engine_group_before_spawning() -> None:
-    with pytest.raises(ValueError, match="fit on one node"):
+class _EightGpuCluster:
+    num_gpus_per_node = 4
+
+    @staticmethod
+    def world_size() -> int:
+        return 8
+
+
+def test_runtime_rejects_engine_group_that_does_not_use_whole_nodes() -> None:
+    with pytest.raises(ValueError, match="whole nodes"):
+        ManagedDynamoRuntime(cluster=_Cluster(), config=_config(tp=6))
+
+
+def test_runtime_places_an_engine_group_on_several_whole_nodes() -> None:
+    runtime = ManagedDynamoRuntime(cluster=_EightGpuCluster(), config=_config(tp=8))
+    assert runtime._nodes_per_engine == 2
+    assert runtime._worker_roles == ["aggregated"]
+    assert (
+        ManagedDynamoRuntime(cluster=_Cluster(), config=_config(tp=2))._nodes_per_engine
+        == 1
+    )
+
+
+def test_runtime_rejects_a_multi_node_engine_group_that_leaves_nodes_over() -> None:
+    with pytest.raises(ValueError, match="divisible by TP"):
         ManagedDynamoRuntime(cluster=_Cluster(), config=_config(tp=8))
 
 
@@ -661,6 +685,8 @@ def test_fixed_pool_detects_worker_membership_change(monkeypatch) -> None:
     reservation_metadata = {"node_ip": "10.0.0.1", "gpu_id": 0}
     reservation = _FakeReservation(metadata=reservation_metadata)
     pool = object.__new__(FixedDynamoWorkerPool)
+    pool._followers = []
+    pool._follower_cleanup_reservations = []
     pool._workers = [_FakeWorker(metadata={"instance_id": "changed"})]
     pool._reservations = [reservation]
     pool._cleanup_reservations = [reservation]
@@ -689,6 +715,8 @@ def test_fixed_pool_detects_reservation_membership_change(monkeypatch) -> None:
     changed_reservation = {"node_ip": "10.0.0.2", "gpu_id": 0}
     reservation = _FakeReservation(metadata=changed_reservation)
     pool = object.__new__(FixedDynamoWorkerPool)
+    pool._followers = []
+    pool._follower_cleanup_reservations = []
     pool._workers = [_FakeWorker(metadata=expected_worker)]
     pool._reservations = [reservation]
     pool._cleanup_reservations = [reservation]
@@ -742,6 +770,7 @@ def test_fixed_pool_tracks_worker_before_metadata_failure(monkeypatch) -> None:
         worker_roles=["aggregated"],
         manager_env={},
         startup_timeout_s=5,
+        nodes_per_engine=1,
     )
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.worker_pool.DynamoGpuReservation",
@@ -836,6 +865,7 @@ def test_fixed_pool_launches_all_workers_before_waiting_for_model_metadata(
         worker_roles=["decode", "prefill"],
         manager_env={},
         startup_timeout_s=5,
+        nodes_per_engine=1,
     )
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.worker_pool.DynamoGpuReservation",
@@ -957,6 +987,7 @@ def test_fixed_pool_scopes_ports_per_node_while_roles_stay_fleet_global(
         worker_roles=["decode", "decode", "prefill", "prefill"],
         manager_env={},
         startup_timeout_s=5,
+        nodes_per_engine=1,
     )
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.worker_pool.DynamoGpuReservation",
@@ -1016,6 +1047,8 @@ def test_fixed_pool_scopes_ports_per_node_while_roles_stay_fleet_global(
 
 def test_fixed_pool_shutdown_releases_workers_and_reservations(monkeypatch) -> None:
     pool = object.__new__(FixedDynamoWorkerPool)
+    pool._followers = []
+    pool._follower_cleanup_reservations = []
     worker = _FakeWorker()
     reservation = _FakeReservation()
     pool._workers = [worker]
@@ -1042,6 +1075,8 @@ def test_fixed_pool_shutdown_uses_registered_pid_when_worker_dies(monkeypatch) -
     worker = _FakeWorker()
     reservation = _FakeReservation()
     pool = object.__new__(FixedDynamoWorkerPool)
+    pool._followers = []
+    pool._follower_cleanup_reservations = []
     pool._workers = [worker]
     pool._reservations = [reservation]
     pool._cleanup_reservations = [reservation]
@@ -1252,3 +1287,136 @@ def test_frontend_rejects_incomplete_disaggregated_registration(
         runtime._wait_for_frontend(expected_components={"backend": 1, "prefill": 1})
 
     assert urls == ["http://127.0.0.1:3000/health"]
+
+
+def test_fixed_pool_starts_a_leader_and_headless_followers_for_a_multi_node_engine(
+    monkeypatch,
+) -> None:
+    reservations = iter(
+        [
+            _FakeReservation(
+                metadata={"node_ip": "10.0.0.1", "gpu_id": gpu}, system_port=4001
+            )
+            for gpu in (0, 1)
+        ]
+        + [
+            _FakeReservation(
+                metadata={"node_ip": "10.0.0.2", "gpu_id": gpu}, system_port=4002
+            )
+            for gpu in (0, 1)
+        ]
+    )
+    leader = _FakeWorker(metadata={"instance_id": "leader"})
+    follower = _FakeWorker()
+    workers_to_launch = iter([leader, follower])
+    launch_kwargs = []
+    actor_names = []
+
+    class RemoteFactory:
+        def __init__(self, actor, record=None):
+            self.actor = actor
+            self.record = record
+
+        def remote(self, *args, **kwargs):
+            if self.record is not None:
+                self.record.append(kwargs)
+            return self.actor
+
+    class ReservationFactory:
+        @staticmethod
+        def options(**kwargs):
+            return RemoteFactory(next(reservations))
+
+    class WorkerFactory:
+        @staticmethod
+        def options(**kwargs):
+            actor_names.append(kwargs["name"])
+            return RemoteFactory(next(workers_to_launch), launch_kwargs)
+
+    class Cluster:
+        @staticmethod
+        def get_placement_groups():
+            return [SimpleNamespace(bundle_count=2), SimpleNamespace(bundle_count=2)]
+
+    pool = FixedDynamoWorkerPool(
+        cluster=Cluster(),
+        config=_config(),
+        namespace="nemo-rl-test",
+        engine_world_size=4,
+        worker_roles=["decode"],
+        manager_env={},
+        startup_timeout_s=5,
+        nodes_per_engine=2,
+    )
+    base = "nemo_rl.models.generation.dynamo.worker_pool"
+    monkeypatch.setattr(f"{base}.DynamoGpuReservation", ReservationFactory)
+    monkeypatch.setattr(f"{base}.DynamoVllmWorker", WorkerFactory)
+    monkeypatch.setattr(
+        f"{base}.make_actor_runtime_env",
+        lambda _fqn: {"py_executable": "python", "env_vars": {}},
+    )
+    monkeypatch.setattr(
+        f"{base}.PlacementGroupSchedulingStrategy", lambda **kwargs: kwargs
+    )
+    monkeypatch.setattr(f"{base}.ray.get", lambda refs, **kwargs: refs)
+
+    pool.start()
+
+    assert actor_names == [
+        "nemo-rl-test-dynamo-vllm-decode-0",
+        "nemo-rl-test-dynamo-vllm-decode-0-node1",
+    ]
+    assert [kwargs["multi_node"] for kwargs in launch_kwargs] == [
+        MultiNodeEngine(
+            nnodes=2, node_rank=0, master_addr="10.0.0.1", master_port=4001
+        ),
+        MultiNodeEngine(
+            nnodes=2, node_rank=1, master_addr="10.0.0.1", master_port=4001
+        ),
+    ]
+    assert [kwargs["cuda_devices"] for kwargs in launch_kwargs] == [[0, 1], [0, 1]]
+    assert launch_kwargs[0]["seed"] == launch_kwargs[1]["seed"]
+    assert [kwargs["worker_role"] for kwargs in launch_kwargs] == ["decode", "decode"]
+    # Refit addresses the leader only; the follower has no Dynamo endpoint.
+    assert pool._workers == [leader]
+    assert pool._followers == [follower]
+    assert pool._metadata == [{"instance_id": "leader"}]
+    assert pool.size == 1
+    assert pool.refit_workers() == [{"instance_id": "leader"}]
+
+
+def test_fixed_pool_reports_a_dead_follower_as_not_alive() -> None:
+    pool = object.__new__(FixedDynamoWorkerPool)
+    pool._workers = [_FakeWorker(alive=True)]
+    pool._followers = [_FakeWorker(alive=False)]
+
+    import nemo_rl.models.generation.dynamo.worker_pool as worker_pool_module
+
+    original = worker_pool_module.ray.get
+    worker_pool_module.ray.get = lambda refs, **kwargs: refs
+    try:
+        assert pool.is_alive() is False
+    finally:
+        worker_pool_module.ray.get = original
+
+
+def test_fixed_pool_splits_placement_groups_into_whole_node_engines() -> None:
+    pool = object.__new__(FixedDynamoWorkerPool)
+    pool._engine_world_size = 8
+    pool._nodes_per_engine = 2
+    groups = [SimpleNamespace(bundle_count=4) for _ in range(4)]
+
+    engines = pool._engine_node_groups(groups)
+
+    assert [[pg for pg, _ in engine] for engine in engines] == [
+        groups[:2],
+        groups[2:],
+    ]
+    assert [[bundles for _, bundles in engine] for engine in engines][0] == [
+        [0, 1, 2, 3],
+        [0, 1, 2, 3],
+    ]
+    with pytest.raises(ValueError, match="cannot be split"):
+        pool._engine_node_groups(groups[:3])
+    with pytest.raises(ValueError, match="uses all 4 GPUs"):
+        pool._engine_node_groups([SimpleNamespace(bundle_count=2)] * 4)

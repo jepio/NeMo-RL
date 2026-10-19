@@ -75,11 +75,18 @@ class ManagedDynamoRuntime:
         self._config = validated_config.model_dump()
         self._dynamo_cfg = validated_config.dynamo_cfg
         self._engine_world_size = validated_config.engine_world_size
-        if self._engine_world_size > cluster.num_gpus_per_node:
+        gpus_per_node = cluster.num_gpus_per_node
+        if self._engine_world_size <= gpus_per_node:
+            self._nodes_per_engine = 1
+        elif self._engine_world_size % gpus_per_node == 0:
+            # The ranks of one engine span whole nodes: a leader node and headless
+            # nodes that host vLLM workers only.
+            self._nodes_per_engine = self._engine_world_size // gpus_per_node
+        else:
             raise ValueError(
-                "Managed Dynamo requires each TP/PP engine group to fit on one "
-                f"node: tp*pp={self._engine_world_size} exceeds "
-                f"cluster.num_gpus_per_node={cluster.num_gpus_per_node}"
+                "Managed Dynamo engines larger than one node must use whole nodes: "
+                f"tp*pp={self._engine_world_size} is not a multiple of "
+                f"cluster.num_gpus_per_node={gpus_per_node}"
             )
         cluster_world_size = cluster.world_size()
         if cluster_world_size % self._engine_world_size != 0:
@@ -209,6 +216,7 @@ class ManagedDynamoRuntime:
                 worker_roles=self._worker_roles,
                 manager_env=self._manager_env,
                 startup_timeout_s=self._dynamo_cfg.startup_timeout_s,
+                nodes_per_engine=self._nodes_per_engine,
             )
             self._pool.start()
             self._start_frontend()
