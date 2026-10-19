@@ -165,6 +165,51 @@ policy:
       metrics_exclude_prefixes: null  # null excludes python_ and process_
 ```
 
+### NeMo Gym rollouts
+
+NeMo Gym agents send chat requests to a token wrapper that sits in front of the
+Dynamo frontend. The wrapper renders the chat template and keeps the exact token
+IDs of earlier turns. Three settings decide how fast long, multi-turn rollouts run:
+
+```yaml
+policy:
+  generation:
+    dynamo_cfg:
+      token_wrapper_workers: 8
+      frontend_args:
+        router_mode: kv
+        extra_cli_args:
+        - --router-session-affinity-ttl-secs
+        - "3600"
+        - --router-session-affinity-mode
+        - soft
+env:
+  nemo_gym:
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          forward_session_id_as_conversation_id: true
+```
+
+- `token_wrapper_workers` starts that many wrapper processes as Ray actors, and
+  Gym spreads its sessions over them. One wrapper process can use only one core.
+  It limited a 16-node SWE run to about 28 requests per second until it was
+  split. Each worker builds its own tokenizer, so more than one worker needs the
+  tokenizer config of the policy.
+- The Dynamo frontend, not Gym, chooses the engine for each request. Gym with
+  the vLLM backend keeps every turn of a conversation on one engine so that the
+  prefix cache hits. With the KV router alone, the hit rate of a 30-turn SWE
+  conversation was about 65%, and each model call took twice as long. The
+  session affinity options bind a session to the engine that served it first,
+  and the hit rate returns to about 90%. In `soft` mode the router may still
+  move a session. `hard` mode gave no benefit in our 16-node tests.
+- `forward_session_id_as_conversation_id` makes Gym send its session ID. The
+  wrapper puts it in the `x-dynamo-session-id` header that the router reads.
+- Use the cadenced prefill scheduler of the in-process vLLM engines
+  (`vllm_kwargs.scheduler_cls` and `vllm_kwargs.prefill_schedule_interval`) if
+  your image has it. Decode steps then run between prefill chunks, and the
+  model-call time of a SWE sample fell from about 190 s to 156 s.
+
 ### Prefill/decode disaggregation
 
 Use
