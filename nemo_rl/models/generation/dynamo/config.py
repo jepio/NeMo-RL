@@ -176,7 +176,8 @@ class DynamoDisaggregationConfig(BaseModel, extra="forbid"):
         prefill_vllm_kwargs: vLLM engine arguments that replace the entries of
             ``policy.generation.vllm_kwargs`` for prefill engines only. A prefill
             engine never decodes, so it can use a larger batched-token budget than
-            a decode engine, for example ``{max_num_batched_tokens: 32768}``.
+            a decode engine, for example ``{max_num_batched_tokens: 32768}``. The
+            ``gpu_memory_utilization`` of ``vllm_cfg`` can be replaced here too.
         decode_vllm_kwargs: The same, for decode engines only.
     """
 

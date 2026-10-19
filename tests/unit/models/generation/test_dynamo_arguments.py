@@ -456,7 +456,10 @@ def test_disaggregated_role_kwargs_replace_shared_engine_kwargs_per_role() -> No
     dynamo_cfg["disaggregation"] = {
         "prefill_workers": 1,
         "decode_workers": 1,
-        "prefill_vllm_kwargs": {"max_num_batched_tokens": 32768},
+        "prefill_vllm_kwargs": {
+            "max_num_batched_tokens": 32768,
+            "gpu_memory_utilization": 0.92,
+        },
         "decode_vllm_kwargs": {"max_num_seqs": 64},
     }
     cfg = DynamoCfg.model_validate(dynamo_cfg)
@@ -479,6 +482,8 @@ def test_disaggregated_role_kwargs_replace_shared_engine_kwargs_per_role() -> No
     assert _flag_value(prefill_argv, "--max-num-seqs") == "128"
     assert _flag_value(decode_argv, "--max-num-batched-tokens") == "16384"
     assert _flag_value(decode_argv, "--max-num-seqs") == "64"
+    assert _flag_value(prefill_argv, "--gpu-memory-utilization") == "0.92"
+    assert _flag_value(decode_argv, "--gpu-memory-utilization") == "0.8"
 
 
 def test_multi_node_engine_argv_marks_the_leader_and_the_headless_nodes() -> None:

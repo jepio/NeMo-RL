@@ -41,6 +41,10 @@ class MultiNodeEngine:
     master_port: int
 
 
+# vllm_cfg settings that a prefill or decode role may replace through
+# disaggregation.{prefill,decode}_vllm_kwargs. Parallelism and dtype stay shared.
+_ROLE_OVERRIDABLE_CFG_KEYS = ("gpu_memory_utilization",)
+
 _MANAGED_FLAGS = {
     "--nnodes",
     "--node-rank",
@@ -239,6 +243,20 @@ def build_dynamo_vllm_argv(
     builder.add("--trust-remote-code", source="managed runtime")
     builder.add("--seed", seed, source="managed runtime")
 
+    role_kwargs: dict[str, Any] = {}
+    if worker_role != "aggregated":
+        # dynamo_cfg.disaggregation is set: the role branch above required it.
+        role_kwargs = dict(
+            getattr(dynamo_cfg.disaggregation, f"{worker_role}_vllm_kwargs")
+        )
+        vllm_cfg = {
+            **vllm_cfg,
+            **{
+                key: role_kwargs.pop(key)
+                for key in _ROLE_OVERRIDABLE_CFG_KEYS
+                if key in role_kwargs
+            },
+        }
     for key, flag in DYNAMO_VLLM_FLAGS.items():
         value = vllm_cfg.get(key)
         if value is not None:
@@ -295,12 +313,7 @@ def build_dynamo_vllm_argv(
         source="dynamo_cfg.worker_args.endpoint_types",
     )
 
-    engine_kwargs = dict(vllm_kwargs)
-    if worker_role != "aggregated":
-        # dynamo_cfg.disaggregation is set: the role branch above required it.
-        engine_kwargs.update(
-            getattr(dynamo_cfg.disaggregation, f"{worker_role}_vllm_kwargs")
-        )
+    engine_kwargs = {**vllm_kwargs, **role_kwargs}
     for key, value in engine_kwargs.items():
         if value is None:
             continue
