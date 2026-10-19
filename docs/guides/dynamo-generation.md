@@ -250,9 +250,14 @@ GPU still stores and reads the KV of each sequence. Set
 the `data_parallel_size` ranks holds the attention weights and the full KV cache
 of its own sequences, and the experts are sharded over
 `tensor_parallel_size * data_parallel_size` ranks, so `expert_parallel_size` must
-equal that product. The engine then has `tp * pp * dp` ranks, and all of them
-must fit on one node. A TP1, DP4, EP4 engine stores each token once instead of
-twice (TP4) and reads it once per step.
+equal that product. The engine then has `tp * pp * dp` ranks. A TP1, DP4, EP4
+engine stores each token once instead of twice (TP4) and reads it once per step.
+When `dp * tp * pp` exceeds one node, the engine spans whole nodes and each data
+parallel rank (`tp * pp` GPUs) must fit on one node. The first node runs the
+leader and the other nodes run headless workers that join through vLLM's
+data-parallel launch (`--data-parallel-address`, `--data-parallel-rpc-port`,
+`--data-parallel-start-rank`). All-to-all between the experts of such an engine
+uses `vllm_kwargs.all2all_backend`; on GB300 try `flashinfer_nvlink_one_sided`.
 
 NeMo RL manages `--disaggregation-mode`, the NIXL connector, NIXL side-channel
 ports, and prefill KV-event ports. Do not set these values in

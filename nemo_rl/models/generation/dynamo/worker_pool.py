@@ -315,6 +315,12 @@ class FixedDynamoWorkerPool:
                         node_rank=node_rank,
                         master_addr=multi_node_master[0],
                         master_port=multi_node_master[1],
+                        data_parallel_size_local=(
+                            len(plan["cuda_devices"])
+                            // (self._engine_world_size // self._data_parallel_size)
+                            if self._data_parallel_size > 1
+                            else None
+                        ),
                     )
                     if multi_node_master is not None
                     else None

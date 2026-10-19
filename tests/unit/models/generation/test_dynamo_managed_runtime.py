@@ -1426,7 +1426,7 @@ def test_fixed_pool_splits_placement_groups_into_whole_node_engines() -> None:
         pool._engine_node_groups([SimpleNamespace(bundle_count=2)] * 4)
 
 
-def test_runtime_runs_data_parallel_attention_inside_one_node_only() -> None:
+def test_runtime_places_data_parallel_ranks_on_whole_nodes() -> None:
     config = _config(tp=1)
     config["vllm_cfg"]["data_parallel_size"] = 4
     config["vllm_cfg"]["expert_parallel_size"] = 4
@@ -1435,10 +1435,26 @@ def test_runtime_runs_data_parallel_attention_inside_one_node_only() -> None:
     assert runtime._data_parallel_size == 4
     assert runtime._nodes_per_engine == 1
 
+    # DP8 of TP1 spans two four-GPU nodes, with four ranks on each.
     config["vllm_cfg"]["data_parallel_size"] = 8
     config["vllm_cfg"]["expert_parallel_size"] = 8
-    with pytest.raises(ValueError, match="inside one node only"):
-        ManagedDynamoRuntime(cluster=_EightGpuCluster(), config=config)
+    runtime = ManagedDynamoRuntime(cluster=_EightGpuCluster(), config=config)
+    assert runtime._nodes_per_engine == 2
+
+    # A data-parallel rank of TP8 does not fit on a four-GPU node.
+    config = _config(tp=8)
+    config["vllm_cfg"]["data_parallel_size"] = 2
+    config["vllm_cfg"]["expert_parallel_size"] = 16
+
+    class _SixteenGpuCluster:
+        num_gpus_per_node = 4
+
+        @staticmethod
+        def world_size() -> int:
+            return 16
+
+    with pytest.raises(ValueError, match="must fit on one node"):
+        ManagedDynamoRuntime(cluster=_SixteenGpuCluster(), config=config)
 
 
 def test_fixed_pool_gives_each_data_parallel_engine_its_own_port_range(
@@ -1511,3 +1527,79 @@ def test_fixed_pool_gives_each_data_parallel_engine_its_own_port_range(
     # Two engines of two data-parallel ranks share one node: ports never overlap.
     assert [kwargs["nixl_port"] for kwargs in launch_kwargs] == [4100, 4102]
     assert [kwargs["kv_event_port"] for kwargs in launch_kwargs] == [None, 4202]
+
+
+def test_fixed_pool_starts_data_parallel_nodes_with_a_local_rank_count(
+    monkeypatch,
+) -> None:
+    reservations = iter(
+        _FakeReservation(
+            metadata={"node_ip": f"10.0.0.{node + 1}", "gpu_id": gpu},
+            system_port=4001 + node,
+        )
+        for node in range(2)
+        for gpu in range(4)
+    )
+    leader = _FakeWorker(metadata={"instance_id": "leader"})
+    follower = _FakeWorker()
+    workers_to_launch = iter([leader, follower])
+    launch_kwargs = []
+
+    class RemoteFactory:
+        def __init__(self, actor, record=None):
+            self.actor = actor
+            self.record = record
+
+        def remote(self, *args, **kwargs):
+            if self.record is not None:
+                self.record.append(kwargs)
+            return self.actor
+
+    class ReservationFactory:
+        @staticmethod
+        def options(**kwargs):
+            return RemoteFactory(next(reservations))
+
+    class WorkerFactory:
+        @staticmethod
+        def options(**kwargs):
+            return RemoteFactory(next(workers_to_launch), launch_kwargs)
+
+    class Cluster:
+        @staticmethod
+        def get_placement_groups():
+            return [SimpleNamespace(bundle_count=4), SimpleNamespace(bundle_count=4)]
+
+    pool = FixedDynamoWorkerPool(
+        cluster=Cluster(),
+        config=_config(),
+        namespace="nemo-rl-test",
+        engine_world_size=8,
+        worker_roles=["decode"],
+        manager_env={},
+        startup_timeout_s=5,
+        nodes_per_engine=2,
+        data_parallel_size=8,
+    )
+    base = "nemo_rl.models.generation.dynamo.worker_pool"
+    monkeypatch.setattr(f"{base}.DynamoGpuReservation", ReservationFactory)
+    monkeypatch.setattr(f"{base}.DynamoVllmWorker", WorkerFactory)
+    monkeypatch.setattr(
+        f"{base}.make_actor_runtime_env",
+        lambda _fqn: {"py_executable": "python", "env_vars": {}},
+    )
+    monkeypatch.setattr(
+        f"{base}.PlacementGroupSchedulingStrategy", lambda **kwargs: kwargs
+    )
+    monkeypatch.setattr(f"{base}.ray.get", lambda refs, **kwargs: refs)
+
+    pool.start()
+
+    assert [
+        (kwargs["multi_node"].node_rank, kwargs["multi_node"].data_parallel_size_local)
+        for kwargs in launch_kwargs
+    ] == [(0, 4), (1, 4)]
+    # Eight data-parallel ranks take eight ports on each node.
+    assert [kwargs["nixl_port"] for kwargs in launch_kwargs] == [4100, 4100]
+    assert pool._workers == [leader]
+    assert pool._followers == [follower]

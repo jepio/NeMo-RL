@@ -848,3 +848,54 @@ def test_data_parallel_size_is_managed_in_vllm_kwargs() -> None:
             worker_role="aggregated",
             kv_event_port=None,
         )
+
+
+def test_multi_node_data_parallel_argv_uses_the_data_parallel_launch() -> None:
+    vllm_cfg = {
+        **_config()["vllm_cfg"],
+        "tensor_parallel_size": 1,
+        "data_parallel_size": 8,
+        "expert_parallel_size": 8,
+    }
+    common = {
+        "model_name": "model",
+        "namespace": "nemo-rl-1",
+        "seed": 7,
+        "vllm_cfg": vllm_cfg,
+        "vllm_kwargs": {},
+        "dynamo_cfg": DynamoCfg.model_validate(_dynamo_cfg()),
+        "worker_role": "aggregated",
+        "kv_event_port": None,
+    }
+    leader = build_dynamo_vllm_argv(
+        **common,
+        multi_node=MultiNodeEngine(
+            nnodes=2,
+            node_rank=0,
+            master_addr="10.0.0.1",
+            master_port=4001,
+            data_parallel_size_local=4,
+        ),
+    )
+    follower = build_dynamo_vllm_argv(
+        **common,
+        multi_node=MultiNodeEngine(
+            nnodes=2,
+            node_rank=1,
+            master_addr="10.0.0.1",
+            master_port=4001,
+            data_parallel_size_local=4,
+        ),
+    )
+
+    for argv in (leader, follower):
+        assert _flag_value(argv, "--data-parallel-size") == "8"
+        assert _flag_value(argv, "--data-parallel-size-local") == "4"
+        assert _flag_value(argv, "--data-parallel-address") == "10.0.0.1"
+        assert _flag_value(argv, "--data-parallel-rpc-port") == "4001"
+        assert "--nnodes" not in argv
+        assert "--node-rank" not in argv
+    assert "--data-parallel-start-rank" not in leader
+    assert "--headless" not in leader
+    assert _flag_value(follower, "--data-parallel-start-rank") == "4"
+    assert "--headless" in follower

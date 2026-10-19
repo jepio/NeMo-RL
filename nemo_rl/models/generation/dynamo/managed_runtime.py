@@ -89,12 +89,16 @@ class ManagedDynamoRuntime:
                 f"cluster.num_gpus_per_node={gpus_per_node}"
             )
         self._data_parallel_size = validated_config.vllm_cfg.data_parallel_size
-        if self._data_parallel_size > 1 and self._nodes_per_engine > 1:
+        tp_pp = self._engine_world_size // self._data_parallel_size
+        if (
+            self._data_parallel_size > 1
+            and self._nodes_per_engine > 1
+            and gpus_per_node % tp_pp != 0
+        ):
             raise ValueError(
-                "Managed Dynamo runs data-parallel attention inside one node only: "
-                f"data_parallel_size={self._data_parallel_size} with "
-                f"tp*pp*dp={self._engine_world_size} spans {self._nodes_per_engine} "
-                "nodes"
+                "A data-parallel rank of a multi-node Managed Dynamo engine must fit "
+                f"on one node: tp*pp={tp_pp} does not divide "
+                f"cluster.num_gpus_per_node={gpus_per_node}"
             )
         cluster_world_size = cluster.world_size()
         if cluster_world_size % self._engine_world_size != 0:

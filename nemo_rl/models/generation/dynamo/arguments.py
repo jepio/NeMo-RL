@@ -39,6 +39,10 @@ class MultiNodeEngine:
     node_rank: int
     master_addr: str
     master_port: int
+    # None: the ranks are TP x PP ranks that span the nodes. A number: the engine
+    # has data-parallel ranks, this many per node, and the nodes join through
+    # vLLM's data-parallel launch (address, RPC port and start rank) instead.
+    data_parallel_size_local: int | None = None
 
 
 # vllm_cfg settings that a prefill or decode role may replace through
@@ -46,6 +50,10 @@ class MultiNodeEngine:
 _ROLE_OVERRIDABLE_CFG_KEYS = ("gpu_memory_utilization",)
 
 _MANAGED_FLAGS = {
+    "--data-parallel-size-local",
+    "--data-parallel-address",
+    "--data-parallel-rpc-port",
+    "--data-parallel-start-rank",
     "--nnodes",
     "--node-rank",
     "--master-addr",
@@ -171,7 +179,27 @@ def build_dynamo_vllm_argv(
     node of an engine whose TP x PP ranks span several nodes.
     """
     builder = _ArgvBuilder()
-    if multi_node is not None:
+    if multi_node is not None and multi_node.data_parallel_size_local is not None:
+        local = multi_node.data_parallel_size_local
+        builder.add("--data-parallel-size-local", local, source="managed multi-node")
+        builder.add(
+            "--data-parallel-address",
+            multi_node.master_addr,
+            source="managed multi-node",
+        )
+        builder.add(
+            "--data-parallel-rpc-port",
+            multi_node.master_port,
+            source="managed multi-node",
+        )
+        if multi_node.node_rank > 0:
+            builder.add(
+                "--data-parallel-start-rank",
+                multi_node.node_rank * local,
+                source="managed multi-node",
+            )
+            builder.add("--headless", source="managed multi-node")
+    elif multi_node is not None:
         builder.add("--nnodes", multi_node.nnodes, source="managed multi-node")
         builder.add("--node-rank", multi_node.node_rank, source="managed multi-node")
         builder.add(
