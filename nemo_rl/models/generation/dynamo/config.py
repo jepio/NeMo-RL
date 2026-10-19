@@ -20,6 +20,7 @@ from typing import Annotated, Any, Literal
 from pydantic import (
     BaseModel,
     BeforeValidator,
+    Field,
     PositiveFloat,
     PositiveInt,
     model_validator,
@@ -172,11 +173,18 @@ class DynamoDisaggregationConfig(BaseModel, extra="forbid"):
             between pause and resume, so size the lease for the longest refit
             there. The cost of a long lease is that KV from a lost handoff stays
             allocated on the prefill engine until it ends.
+        prefill_vllm_kwargs: vLLM engine arguments that replace the entries of
+            ``policy.generation.vllm_kwargs`` for prefill engines only. A prefill
+            engine never decodes, so it can use a larger batched-token budget than
+            a decode engine, for example ``{max_num_batched_tokens: 32768}``.
+        decode_vllm_kwargs: The same, for decode engines only.
     """
 
     prefill_workers: PositiveInt
     decode_workers: PositiveInt
     kv_lease_duration_s: PositiveInt = 1800
+    prefill_vllm_kwargs: dict[str, Any] = Field(default_factory=dict)
+    decode_vllm_kwargs: dict[str, Any] = Field(default_factory=dict)
 
 
 class DynamoCfg(BaseModel, extra="forbid"):

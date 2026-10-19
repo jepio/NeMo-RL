@@ -260,7 +260,13 @@ def build_dynamo_vllm_argv(
         source="dynamo_cfg.worker_args.endpoint_types",
     )
 
-    for key, value in vllm_kwargs.items():
+    engine_kwargs = dict(vllm_kwargs)
+    if worker_role != "aggregated":
+        # dynamo_cfg.disaggregation is set: the role branch above required it.
+        engine_kwargs.update(
+            getattr(dynamo_cfg.disaggregation, f"{worker_role}_vllm_kwargs")
+        )
+    for key, value in engine_kwargs.items():
         if value is None:
             continue
         # num_speculative_tokens=0 is how a launch script turns speculative decoding

@@ -226,7 +226,11 @@ policy:
         kv_lease_duration_s: 1800
 ```
 
-Both roles use the same `vllm_cfg` and `vllm_kwargs`. The required inference
+Both roles use the same `vllm_cfg` and `vllm_kwargs`. To tune one role, set
+`disaggregation.prefill_vllm_kwargs` or `disaggregation.decode_vllm_kwargs`.
+Their entries replace the matching `vllm_kwargs` entries for that role only. For
+example, a prefill engine never decodes, so it can take a larger prefill chunk:
+`prefill_vllm_kwargs: {max_num_batched_tokens: 32768}`. The required inference
 GPU count is:
 
 ```text

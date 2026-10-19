@@ -450,6 +450,77 @@ def test_disaggregated_worker_argv_owns_role_and_nixl_configuration() -> None:
     }
 
 
+def test_disaggregated_role_kwargs_replace_shared_engine_kwargs_per_role() -> None:
+    dynamo_cfg = _dynamo_cfg()
+    dynamo_cfg["disaggregation"] = {
+        "prefill_workers": 1,
+        "decode_workers": 1,
+        "prefill_vllm_kwargs": {"max_num_batched_tokens": 32768},
+        "decode_vllm_kwargs": {"max_num_seqs": 64},
+    }
+    cfg = DynamoCfg.model_validate(dynamo_cfg)
+    common = {
+        "model_name": "model",
+        "namespace": "nemo-rl-1",
+        "seed": 7,
+        "vllm_cfg": _config()["vllm_cfg"],
+        "vllm_kwargs": {"max_num_batched_tokens": 16384, "max_num_seqs": 128},
+        "dynamo_cfg": cfg,
+    }
+    prefill_argv = build_dynamo_vllm_argv(
+        **common, worker_role="prefill", kv_event_port=4201
+    )
+    decode_argv = build_dynamo_vllm_argv(
+        **common, worker_role="decode", kv_event_port=None
+    )
+
+    assert _flag_value(prefill_argv, "--max-num-batched-tokens") == "32768"
+    assert _flag_value(prefill_argv, "--max-num-seqs") == "128"
+    assert _flag_value(decode_argv, "--max-num-batched-tokens") == "16384"
+    assert _flag_value(decode_argv, "--max-num-seqs") == "64"
+
+
+def test_aggregated_worker_ignores_disaggregation_role_kwargs() -> None:
+    dynamo_cfg = _dynamo_cfg()
+    dynamo_cfg["disaggregation"] = {
+        "prefill_workers": 1,
+        "decode_workers": 1,
+        "prefill_vllm_kwargs": {"max_num_batched_tokens": 32768},
+    }
+    argv = build_dynamo_vllm_argv(
+        model_name="model",
+        namespace="nemo-rl-1",
+        seed=7,
+        vllm_cfg=_config()["vllm_cfg"],
+        vllm_kwargs={"max_num_batched_tokens": 16384},
+        dynamo_cfg=DynamoCfg.model_validate(dynamo_cfg),
+        worker_role="aggregated",
+        kv_event_port=None,
+    )
+
+    assert _flag_value(argv, "--max-num-batched-tokens") == "16384"
+
+
+def test_disaggregated_role_kwargs_may_not_override_managed_options() -> None:
+    dynamo_cfg = _dynamo_cfg()
+    dynamo_cfg["disaggregation"] = {
+        "prefill_workers": 1,
+        "decode_workers": 1,
+        "prefill_vllm_kwargs": {"worker_extension_cls": "x.Y"},
+    }
+    with pytest.raises(ValueError, match="managed option"):
+        build_dynamo_vllm_argv(
+            model_name="model",
+            namespace="nemo-rl-1",
+            seed=7,
+            vllm_cfg=_config()["vllm_cfg"],
+            vllm_kwargs={},
+            dynamo_cfg=DynamoCfg.model_validate(dynamo_cfg),
+            worker_role="prefill",
+            kv_event_port=4201,
+        )
+
+
 def test_disaggregated_kv_lease_defaults_to_outlast_a_refit() -> None:
     cfg = DynamoCfg.model_validate(
         {
