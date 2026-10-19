@@ -314,6 +314,7 @@ class DynamoGeneration(GenerationInterface):
                     ),
                     request_timeout_s=dynamo_cfg.request_timeout_s,
                     max_model_len=int(self.cfg["vllm_cfg"]["max_model_len"]),
+                    age_priority=dynamo_cfg.age_priority,
                 )
                 if dynamo_cfg.token_wrapper_workers == 1:
                     self._token_wrapper_server = DynamoTokenWrapperServer(

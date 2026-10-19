@@ -201,6 +201,12 @@ class DynamoCfg(BaseModel, extra="forbid"):
     # prompts. More than one runs each as its own Ray actor, spread over the cluster,
     # with a tokenizer of its own and its own URL.
     token_wrapper_workers: PositiveInt = 1
+    # Give each NeMo-Gym conversation a request priority from the time its first
+    # request arrived: an older conversation is served before a newer one. Async
+    # GRPO trains on groups that were started for an exact step, and a late group
+    # stalls the trainer, so the oldest conversations must not wait behind newer
+    # ones. The engines must run with vllm_kwargs.scheduling_policy: priority.
+    age_priority: bool = False
     worker_args: DynamoWorkerArgs
     frontend_args: DynamoFrontendArgs
     metrics_include_prefixes: list[str] | None
@@ -379,6 +385,15 @@ class DynamoConfig(BaseModel, extra="allow"):
     @model_validator(mode="after")
     def _validate_backend_boundary(self) -> "DynamoConfig":
         extra = self.model_extra or {}
+        if (
+            self.dynamo_cfg.age_priority
+            and self.vllm_kwargs.get("scheduling_policy") != "priority"
+        ):
+            raise ValueError(
+                "policy.generation.dynamo_cfg.age_priority requires "
+                "policy.generation.vllm_kwargs.scheduling_policy: priority, or "
+                "vLLM rejects a request with a priority"
+            )
         # Shared GRPO YAML inheritance supplies mcore_generation_config and
         # refit_cfg. Managed Dynamo uses vLLM arguments and the collective
         # synchronizer instead, so these two sections are intentionally ignored.

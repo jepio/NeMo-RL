@@ -210,6 +210,21 @@ env:
   your image has it. Decode steps then run between prefill chunks, and the
   model-call time of a SWE sample fell from about 190 s to 156 s.
 
+### Serve the oldest conversations first
+
+Async GRPO trains step N on groups that were started for exactly step N, and it
+waits until all of them are done. One slow conversation in one group therefore
+stalls the trainer, and the trainer waits while the replay buffer holds many
+groups for later steps. Each turn of a conversation is a new request, so by
+default a late turn of an old conversation queues behind the first turns of newer
+ones, and with many conversations in flight the old groups run late.
+
+Set `dynamo_cfg.age_priority: true` and `vllm_kwargs.scheduling_policy: priority`.
+The token wrapper then gives each conversation a request priority from the time
+of its first request (`nvext.agent_hints.priority`), and vLLM serves older
+conversations first. The wrapper needs `forward_session_id_as_conversation_id` to
+know the conversation.
+
 ### Prefill/decode disaggregation
 
 Use

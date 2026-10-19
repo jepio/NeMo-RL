@@ -899,3 +899,14 @@ def test_multi_node_data_parallel_argv_uses_the_data_parallel_launch() -> None:
     assert "--headless" not in leader
     assert _flag_value(follower, "--data-parallel-start-rank") == "4"
     assert "--headless" in follower
+
+
+def test_age_priority_requires_the_vllm_priority_scheduling_policy() -> None:
+    config = _config()
+    config["dynamo_cfg"]["age_priority"] = True
+    with pytest.raises(ValidationError, match="scheduling_policy: priority"):
+        DynamoConfig.model_validate(config)
+
+    config["vllm_kwargs"] = {"scheduling_policy": "priority"}
+    assert DynamoConfig.model_validate(config).dynamo_cfg.age_priority is True
+    assert DynamoConfig.model_validate(_config()).dynamo_cfg.age_priority is False

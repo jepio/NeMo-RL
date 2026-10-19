@@ -17,6 +17,7 @@
 import asyncio
 import json
 import threading
+import time
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from typing import Any, Optional
@@ -39,6 +40,24 @@ except ImportError:  # pragma: no cover - orjson is a NeMo RL dependency
 # router binds a session to one worker when session affinity is on
 # (``--router-session-affinity-ttl-secs``), so every turn of a rollout reaches the
 # engine that holds its prefix.
+# Epoch seconds are about 1.8e9, which fits a signed 32-bit integer, but the
+# request priority is a negated age in seconds from this base, so it stays far
+# from the limit.
+_AGE_PRIORITY_EPOCH_S = 1_700_000_000
+_MAX_TRACKED_SESSIONS = 100_000
+
+
+def age_priority(first_seen_epoch_s: float) -> int:
+    """Return the Dynamo agent-hint priority of a conversation first seen at a time.
+
+    Dynamo gives a request with a higher agent-hint priority an earlier place, and
+    its vLLM handler hands vLLM the negated value, where lower runs first. The
+    priority falls as the first request of a conversation gets newer, so older
+    conversations run first.
+    """
+    return -int(first_seen_epoch_s - _AGE_PRIORITY_EPOCH_S)
+
+
 DYNAMO_SESSION_ID_HEADER = "x-dynamo-session-id"
 
 
@@ -516,6 +535,7 @@ class DynamoTokenWrapperHost:
         exclude_tools_when_tool_choice_none: bool,
         request_timeout_s: Optional[float],
         max_model_len: Optional[int],
+        age_priority: bool,
     ) -> None:
         from nemo_rl.algorithms.utils import get_tokenizer
         from nemo_rl.utils.fastokens import maybe_patch_fastokens
@@ -528,6 +548,7 @@ class DynamoTokenWrapperHost:
             exclude_tools_when_tool_choice_none=exclude_tools_when_tool_choice_none,
             request_timeout_s=request_timeout_s,
             max_model_len=max_model_len,
+            age_priority=age_priority,
         )
 
     def start(self) -> str:
@@ -550,9 +571,12 @@ class DynamoTokenWrapperServer:
         tokenizer_chat_template_kwargs: Optional[dict[str, Any]],
         exclude_tools_when_tool_choice_none: bool,
         request_timeout_s: Optional[float],
+        age_priority: bool,
         max_model_len: Optional[int] = None,
     ) -> None:
         self.dynamo_frontend_base_url = dynamo_frontend_base_url
+        self.age_priority = age_priority
+        self._session_first_seen: dict[str, float] = {}
         self.tokenizer = tokenizer
         self.tokenizer_chat_template_kwargs = tokenizer_chat_template_kwargs
         self.exclude_tools_when_tool_choice_none = exclude_tools_when_tool_choice_none
@@ -623,6 +647,8 @@ class DynamoTokenWrapperServer:
                 raise HTTPException(status_code=400, detail=str(e)) from e
 
             session_id = pop_gym_conversation_id(prepared_body)
+            if self.age_priority and session_id:
+                self._apply_age_priority(prepared_body, session_id)
             status_code, response_body = await self._forward_chat_completion(
                 prepared_body,
                 authorization=request.headers.get("authorization"),
@@ -665,6 +691,20 @@ class DynamoTokenWrapperServer:
         )
         self.thread.start()
         return self.base_url
+
+    def _apply_age_priority(
+        self, request_body: dict[str, Any], session_id: str
+    ) -> None:
+        """Set the agent-hint priority of a request from the age of its session."""
+        first_seen = self._session_first_seen.get(session_id)
+        if first_seen is None:
+            first_seen = time.time()
+            self._session_first_seen[session_id] = first_seen
+            while len(self._session_first_seen) > _MAX_TRACKED_SESSIONS:
+                # Insertion order: the oldest conversation goes first.
+                del self._session_first_seen[next(iter(self._session_first_seen))]
+        nvext = request_body.setdefault("nvext", {})
+        nvext.setdefault("agent_hints", {})["priority"] = age_priority(first_seen)
 
     async def _forward_chat_completion(
         self,

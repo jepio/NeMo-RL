@@ -14,6 +14,8 @@
 
 import asyncio
 import json
+import sys
+from types import SimpleNamespace
 
 import pytest
 from transformers import AutoTokenizer
@@ -23,6 +25,7 @@ from nemo_rl.models.generation.dynamo.token_wrapper import (
     DynamoTokenWrapperServer,
     _inject_gym_token_metadata,
     _validate_engine_data,
+    age_priority,
     pop_gym_conversation_id,
     prepare_dynamo_chat_completion_request,
 )
@@ -718,6 +721,7 @@ def test_forward_chat_completion_reuses_loop_bound_session() -> None:
         tokenizer_chat_template_kwargs=None,
         exclude_tools_when_tool_choice_none=True,
         request_timeout_s=30,
+        age_priority=False,
     )
     session = FakeSession()
     server._client_session = session
@@ -759,6 +763,7 @@ def test_forward_chat_completion_sends_json_bytes_and_parses_the_reply() -> None
         tokenizer_chat_template_kwargs=None,
         exclude_tools_when_tool_choice_none=True,
         request_timeout_s=30,
+        age_priority=False,
     )
     session = FakeSession()
     server._client_session = session
@@ -797,6 +802,7 @@ def test_forward_chat_completion_keeps_a_reply_that_is_not_json() -> None:
         tokenizer_chat_template_kwargs=None,
         exclude_tools_when_tool_choice_none=True,
         request_timeout_s=30,
+        age_priority=False,
     )
     server._client_session = FakeSession()
 
@@ -849,6 +855,7 @@ def test_forward_chat_completion_sends_the_session_as_a_dynamo_header() -> None:
         tokenizer_chat_template_kwargs=None,
         exclude_tools_when_tool_choice_none=True,
         request_timeout_s=30,
+        age_priority=False,
     )
     session = FakeSession()
     server._client_session = session
@@ -861,3 +868,63 @@ def test_forward_chat_completion_sends_the_session_as_a_dynamo_header() -> None:
 
     assert session.headers[0][DYNAMO_SESSION_ID_HEADER] == "s1"
     assert DYNAMO_SESSION_ID_HEADER not in session.headers[1]
+
+
+def test_age_priority_falls_as_a_conversation_gets_newer() -> None:
+    older = age_priority(1_790_000_000.0)
+    newer = age_priority(1_790_000_100.0)
+
+    # Dynamo runs a higher priority first, so the older conversation has more.
+    assert older > newer
+    assert older - newer == 100
+    # The value fits the signed 32-bit integer of the agent hint.
+    assert -(2**31) < newer < older < 2**31
+
+
+def test_age_priority_is_set_once_per_session_from_its_first_request(
+    monkeypatch,
+) -> None:
+    server = DynamoTokenWrapperServer(
+        dynamo_frontend_base_url="http://dynamo/v1",
+        tokenizer=_Tokenizer(),
+        tokenizer_chat_template_kwargs=None,
+        exclude_tools_when_tool_choice_none=True,
+        request_timeout_s=30,
+        age_priority=True,
+    )
+    module = sys.modules[DynamoTokenWrapperServer.__module__]
+
+    clock = iter([1_790_000_000.0, 1_790_000_050.0])
+    monkeypatch.setattr(module, "time", SimpleNamespace(time=lambda: next(clock)))
+
+    first = {"nvext": {"token_data": [1]}}
+    second = {"nvext": {"token_data": [2]}}
+    repeat = {}
+    server._apply_age_priority(first, "session-a")
+    server._apply_age_priority(second, "session-b")
+    server._apply_age_priority(repeat, "session-a")
+
+    assert first["nvext"]["agent_hints"]["priority"] == age_priority(1_790_000_000.0)
+    assert second["nvext"]["agent_hints"]["priority"] == age_priority(1_790_000_050.0)
+    # A later turn of the first session keeps the priority of its first turn, and
+    # the request without an nvext section gets one.
+    assert repeat["nvext"]["agent_hints"]["priority"] == age_priority(1_790_000_000.0)
+    assert first["nvext"]["token_data"] == [1]
+
+
+def test_age_priority_forgets_the_oldest_sessions_beyond_the_limit(monkeypatch) -> None:
+    module = sys.modules[DynamoTokenWrapperServer.__module__]
+
+    monkeypatch.setattr(module, "_MAX_TRACKED_SESSIONS", 2)
+    server = DynamoTokenWrapperServer(
+        dynamo_frontend_base_url="http://dynamo/v1",
+        tokenizer=_Tokenizer(),
+        tokenizer_chat_template_kwargs=None,
+        exclude_tools_when_tool_choice_none=True,
+        request_timeout_s=30,
+        age_priority=True,
+    )
+    for name in ("a", "b", "c"):
+        server._apply_age_priority({}, name)
+
+    assert list(server._session_first_seen) == ["b", "c"]
