@@ -258,6 +258,8 @@ class DynamoVllmWorker:  # pragma: no cover
             "VIRTUAL_ENV": dynamo_venv,
             "UV_PROJECT_ENVIRONMENT": dynamo_venv,
         }
+        if dynamo_cfg.keep_running_requests_at_refit:
+            managed_worker_env["NRL_KEEP_RUNNING_KV_AT_REFIT"] = "1"
         if nixl_port is not None:
             managed_worker_env.update(
                 {

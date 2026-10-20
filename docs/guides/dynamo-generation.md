@@ -231,6 +231,21 @@ conversation older than that, with `busy_s` (time in model calls) and `idle_s`
 (the rest of its age, for example tools). A large `busy_s` means the model is
 slow for that conversation. A large `idle_s` means the delay is outside the model.
 
+### Keep running requests at a weight update
+
+With `recompute_kv_cache_after_weight_updates: true` a weight update pauses every
+engine and clears its caches, and vLLM preempts every running request so that it
+recomputes its prompt and output on the new weights. On a prefill/decode fleet
+the decode engines do this work. With about 90 running requests of 25k tokens per
+engine, decode stops for about 25 s after every update, and the conversations
+that were in flight lose that time.
+
+Set `dynamo_cfg.keep_running_requests_at_refit: true` to drop only the reusable
+prefix cache and let the running requests continue with the KV that they hold.
+This is what TRT-LLM does for a request that waits for a KV transfer. It changes
+the numerics of those requests, because their old KV stays, so it is off by
+default.
+
 ### Prefill/decode disaggregation
 
 Use

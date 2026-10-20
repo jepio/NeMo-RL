@@ -536,15 +536,91 @@ def _patch_vllm_stale_remote_kv_after_reset(logger) -> bool:
     return True
 
 
+def _patch_vllm_keep_running_kv_on_cache_clear(logger) -> bool:
+    """Let running requests keep their KV when a pause clears the caches.
+
+    ``EngineCore._finish_pause(clear_cache=True)`` resets the caches with
+    ``reset_running_requests=True``. That preempts every running request, so each
+    one recomputes its whole prompt and output on the new weights. On a
+    prefill/decode fleet the decode engines run the recompute: about 90 running
+    requests of about 25k tokens per engine are about 2M tokens, and decode stops
+    for about 25 s after every weight update. TRT-LLM leaves these requests
+    untouched (their KV keeps the previous weights) and only resets the reusable
+    prefix cache.
+
+    With ``NRL_KEEP_RUNNING_KV_AT_REFIT=1`` in the engine's environment the patch
+    does the same: it drops every cached prefix hash with
+    ``Scheduler._nemo_rl_force_reset_prefix_cache`` and leaves the running
+    requests alone. The requests continue on the new weights with the KV that
+    they already hold. Without the variable the behaviour is unchanged.
+
+    Returns:
+        True if the patch is applied, now or before. False if the anchor was not
+        found, so the environment variable has no effect.
+    """
+    try:
+        file_to_patch = _get_vllm_file("v1/engine/core.py")
+    except RuntimeError:
+        logger.warning("Could not locate engine/core.py for the keep-running patch.")
+        return False
+
+    old_clear = (
+        '        self.model_executor.collective_rpc("synchronize_device")\n'
+        "        if clear_cache:\n"
+        "            self._reset_caches()\n"
+    )
+    new_clear = (
+        '        self.model_executor.collective_rpc("synchronize_device")\n'
+        "        if clear_cache:\n"
+        '            if os.environ.get("NRL_KEEP_RUNNING_KV_AT_REFIT") == "1":\n'
+        "                self._nemo_rl_reset_caches_keep_running()\n"
+        "            else:\n"
+        "                self._reset_caches()\n"
+    )
+    old_method_anchor = "    def _finish_pause(self, clear_cache: bool) -> None:\n"
+    new_method = (
+        "    def _nemo_rl_reset_caches_keep_running(self) -> None:\n"
+        '        """NeMo RL: clear the prefix caches and keep the running requests."""\n'
+        "        self.scheduler._nemo_rl_force_reset_prefix_cache()\n"
+        "        if self.scheduler.connector is not None:\n"
+        "            self.scheduler.reset_connector_cache()\n"
+        "        self.reset_mm_cache()\n"
+        "        self.reset_encoder_cache()\n"
+        "\n"
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if "_nemo_rl_reset_caches_keep_running" in content:
+            logger.info("vLLM keep-running patch already applied.")
+            return True
+
+        if old_clear not in content or old_method_anchor not in content:
+            logger.warning(
+                "Could not apply the keep-running patch: expected _finish_pause() "
+                "not found in %s. The vLLM version may have changed, and a pause "
+                "that clears the caches then preempts every running request.",
+                file_to_patch,
+            )
+            return False
+
+        content = content.replace(old_clear, new_clear, 1)
+        content = content.replace(old_method_anchor, new_method + old_method_anchor, 1)
+        write_back(content)
+
+    logger.info("Successfully patched vLLM to keep running requests at a cache clear.")
+    return True
+
+
 def require_held_kv_patches() -> None:
     """Apply the prefill/decode pause patches, and fail if one does not apply.
 
-    A prefill/decode engine needs all three patches. Without the first, the pause
+    A prefill/decode engine needs all four patches. Without the first, the pause
     of a prefill engine waits for a KV lease. Without the second, a pause that
     clears the caches raises an error. Without the third, a decode engine caches
-    KV from the old weights again after a cache clear. These fail late and far
-    from their cause, so a prefill/decode worker calls this before it starts
-    ``dynamo.vllm``.
+    KV from the old weights again after a cache clear. Without the fourth,
+    ``dynamo_cfg.keep_running_requests_at_refit`` has no effect. These fail late
+    and far from their cause, so a prefill/decode worker calls this before it
+    starts ``dynamo.vllm``.
 
     Raises:
         RuntimeError: If the installed vLLM does not match a patch anchor.
@@ -556,6 +632,9 @@ def require_held_kv_patches() -> None:
         "pause_with_held_kv": _patch_vllm_pause_with_held_kv(patch_logger),
         "reset_cache_with_held_kv": _patch_vllm_reset_cache_with_held_kv(patch_logger),
         "stale_remote_kv_after_reset": _patch_vllm_stale_remote_kv_after_reset(
+            patch_logger
+        ),
+        "keep_running_kv_on_cache_clear": _patch_vllm_keep_running_kv_on_cache_clear(
             patch_logger
         ),
     }
@@ -1339,6 +1418,7 @@ def ensure_vllm_source_compat() -> None:
     _patch_vllm_pause_with_held_kv(patch_logger)
     _patch_vllm_reset_cache_with_held_kv(patch_logger)
     _patch_vllm_stale_remote_kv_after_reset(patch_logger)
+    _patch_vllm_keep_running_kv_on_cache_clear(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
 

@@ -211,6 +211,15 @@ class DynamoCfg(BaseModel, extra="forbid"):
     # time the conversation spent inside model calls and outside them. Use it to see
     # whether a late conversation waits for the model or for tools. None turns it off.
     slow_session_log_s: PositiveFloat | None = None
+    # Let the requests that run during a weight update keep the KV they hold. By
+    # default a pause that clears the caches preempts every running request, and
+    # each one recomputes its prompt and output on the new weights. On a
+    # prefill/decode fleet the decode engines do this, and decode stops for about
+    # 25 s after every update. With this option the pause only drops the reusable
+    # prefix cache, as TRT-LLM does for requests that wait for a KV transfer: the
+    # running requests continue on the new weights with their old KV. This
+    # changes the numerics of those requests, so it is off by default.
+    keep_running_requests_at_refit: bool = False
     worker_args: DynamoWorkerArgs
     frontend_args: DynamoFrontendArgs
     metrics_include_prefixes: list[str] | None

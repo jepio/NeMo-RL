@@ -910,3 +910,16 @@ def test_age_priority_requires_the_vllm_priority_scheduling_policy() -> None:
     config["vllm_kwargs"] = {"scheduling_policy": "priority"}
     assert DynamoConfig.model_validate(config).dynamo_cfg.age_priority is True
     assert DynamoConfig.model_validate(_config()).dynamo_cfg.age_priority is False
+
+
+def test_keep_running_requests_at_refit_is_off_by_default() -> None:
+    config = _config()
+    assert (
+        DynamoConfig.model_validate(config).dynamo_cfg.keep_running_requests_at_refit
+        is False
+    )
+    config["dynamo_cfg"]["keep_running_requests_at_refit"] = True
+    assert (
+        DynamoConfig.model_validate(config).dynamo_cfg.keep_running_requests_at_refit
+        is True
+    )

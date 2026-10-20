@@ -1576,3 +1576,50 @@ def test_stale_remote_kv_patch_warns_on_unknown_source(monkeypatch, tmp_path, ca
     assert applied is False
     assert scheduler_source.read_text() == "class Scheduler:\n    pass\n"
     assert "_update_waiting_for_remote_kv() not found" in caplog.text
+
+
+_ENGINE_CORE_SOURCE = """import os
+
+
+class EngineCore:
+    def _reset_caches(self):
+        pass
+
+    def _finish_pause(self, clear_cache: bool) -> None:
+        self.model_executor.collective_rpc("synchronize_device")
+        if clear_cache:
+            self._reset_caches()
+"""
+
+
+def test_keep_running_patch_is_gated_by_the_environment_and_idempotent(
+    monkeypatch, tmp_path
+):
+    core_source = tmp_path / "core.py"
+    core_source.write_text(_ENGINE_CORE_SOURCE)
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(core_source))
+    logger = logging.getLogger(__name__)
+
+    assert patches._patch_vllm_keep_running_kv_on_cache_clear(logger)
+    patched = core_source.read_text()
+    assert 'os.environ.get("NRL_KEEP_RUNNING_KV_AT_REFIT") == "1"' in patched
+    # The default branch still preempts the running requests.
+    assert "            else:\n                self._reset_caches()\n" in patched
+    ast.parse(patched)
+
+    assert patches._patch_vllm_keep_running_kv_on_cache_clear(logger)
+    assert core_source.read_text() == patched
+
+
+def test_keep_running_patch_warns_on_unknown_source(monkeypatch, tmp_path, caplog):
+    core_source = tmp_path / "core.py"
+    core_source.write_text("class EngineCore:\n    pass\n")
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(core_source))
+
+    with caplog.at_level(logging.WARNING):
+        assert not patches._patch_vllm_keep_running_kv_on_cache_clear(
+            logging.getLogger(__name__)
+        )
+
+    assert core_source.read_text() == "class EngineCore:\n    pass\n"
+    assert "_finish_pause() not found" in caplog.text
