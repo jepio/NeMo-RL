@@ -26,6 +26,7 @@ from nemo_rl.models.generation.dynamo.token_wrapper import (
     _inject_gym_token_metadata,
     _validate_engine_data,
     age_priority,
+    prompt_affinity_session_id,
     pop_gym_conversation_id,
     prepare_dynamo_chat_completion_request,
 )
@@ -956,3 +957,29 @@ def test_slow_session_log_reports_model_time_and_idle_time(monkeypatch, capsys) 
     assert "busy_s=100 idle_s=50 last_call_s=60.0" in out
     assert "prompt_tokens=10 completion_tokens=5" in out
     assert "total_prompt_tokens=20 total_completion_tokens=10" in out
+
+
+def test_prompt_affinity_groups_the_samples_of_one_prompt() -> None:
+    start = [
+        {"role": "system", "content": "You are an agent."},
+        {"role": "user", "content": "Fix issue 17."},
+    ]
+    other = [start[0], {"role": "user", "content": "Fix issue 18."}]
+    later = [*start, {"role": "assistant", "content": "ls"}]
+
+    ids = {prompt_affinity_session_id(f"session-{i}", later, 4) for i in range(200)}
+    # One key per sample number below the limit, shared by every sample.
+    assert len(ids) == 4
+    assert prompt_affinity_session_id("session-1", start, 4) == (
+        prompt_affinity_session_id("session-1", later, 4)
+    )
+    assert {i.rsplit("-", 1)[0] for i in ids} == {
+        prompt_affinity_session_id("session-1", start, 4).rsplit("-", 1)[0]
+    }
+    assert (
+        prompt_affinity_session_id("session-1", other, 4).split("-")[0]
+        != (prompt_affinity_session_id("session-1", start, 4).split("-")[0])
+    )
+    # Without a message list the conversation keeps its own id.
+    assert prompt_affinity_session_id("session-1", None, 4) == "session-1"
+    assert prompt_affinity_session_id("session-1", [], 4) == "session-1"

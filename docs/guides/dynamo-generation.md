@@ -231,6 +231,20 @@ conversation older than that, with `busy_s` (time in model calls) and `idle_s`
 (the rest of its age, for example tools). A large `busy_s` means the model is
 slow for that conversation. A large `idle_s` means the delay is outside the model.
 
+### Group the samples of a prompt
+
+GRPO samples several conversations from one prompt, and they start with the same
+system and user messages. With session affinity each conversation is pinned to an
+engine on its own, so the samples of one prompt spread over many engines and each
+engine computes and stores the common start again, at the start of a run and after
+every cache clear.
+
+Set `dynamo_cfg.prompt_affinity_subgroups: 4` (any positive number). The wrapper
+then gives the router a session id built from the first two messages and a
+sample number below that value, so the samples of a prompt share an engine in that
+many groups. A larger value spreads one prompt over more engines and keeps the
+load even; `1` puts all samples of a prompt on one engine.
+
 ### Keep running requests at a weight update
 
 With `recompute_kv_cache_after_weight_updates: true` a weight update pauses every

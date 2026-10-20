@@ -220,6 +220,13 @@ class DynamoCfg(BaseModel, extra="forbid"):
     # running requests continue on the new weights with their old KV. This
     # changes the numerics of those requests, so it is off by default.
     keep_running_requests_at_refit: bool = False
+    # Send the samples of one prompt to the same engine. The wrapper gives the
+    # router a session id built from the first two messages of the conversation
+    # and a sample number below this value, instead of the conversation id. The
+    # samples then share the KV of their common start on one prefill and one
+    # decode engine, and recompute it once after a cache clear. A larger value
+    # spreads one prompt over more engines. None keeps one id per conversation.
+    prompt_affinity_subgroups: PositiveInt | None = None
     worker_args: DynamoWorkerArgs
     frontend_args: DynamoFrontendArgs
     metrics_include_prefixes: list[str] | None

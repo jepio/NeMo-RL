@@ -316,6 +316,7 @@ class DynamoGeneration(GenerationInterface):
                     max_model_len=int(self.cfg["vllm_cfg"]["max_model_len"]),
                     age_priority=dynamo_cfg.age_priority,
                     slow_session_log_s=dynamo_cfg.slow_session_log_s,
+                    prompt_affinity_subgroups=dynamo_cfg.prompt_affinity_subgroups,
                 )
                 if dynamo_cfg.token_wrapper_workers == 1:
                     self._token_wrapper_server = DynamoTokenWrapperServer(

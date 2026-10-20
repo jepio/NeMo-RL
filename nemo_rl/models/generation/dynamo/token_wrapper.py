@@ -15,6 +15,7 @@
 """OpenAI-compatible token wrapper for NeMo-Gym traffic to Dynamo."""
 
 import asyncio
+import hashlib
 import json
 import threading
 import time
@@ -59,6 +60,24 @@ def age_priority(first_seen_epoch_s: float) -> int:
 
 
 DYNAMO_SESSION_ID_HEADER = "x-dynamo-session-id"
+
+
+def prompt_affinity_session_id(session_id: str, messages: Any, subgroups: int) -> str:
+    """Return the router session id that groups the samples of one prompt.
+
+    GRPO samples several conversations from one prompt, and all of them start with
+    the same system and user messages. The router pins a session id to an engine,
+    so a key built from those two messages sends the samples to the same engine,
+    where they share the KV of the common start. ``subgroups`` splits the samples
+    of a prompt into that many keys, so that one engine does not take them all.
+    A request without a message list keeps its own session id.
+    """
+    if not isinstance(messages, list) or not messages:
+        return session_id
+    start = json.dumps(messages[:2], sort_keys=True, default=str)
+    prompt = hashlib.sha1(start.encode()).hexdigest()[:16]
+    sample = int(hashlib.sha1(session_id.encode()).hexdigest()[:8], 16) % subgroups
+    return f"{prompt}-{sample}"
 
 
 def pop_gym_conversation_id(request_body: dict[str, Any]) -> Optional[str]:
@@ -537,6 +556,7 @@ class DynamoTokenWrapperHost:
         max_model_len: Optional[int],
         age_priority: bool,
         slow_session_log_s: Optional[float],
+        prompt_affinity_subgroups: Optional[int],
     ) -> None:
         from nemo_rl.algorithms.utils import get_tokenizer
         from nemo_rl.utils.fastokens import maybe_patch_fastokens
@@ -551,6 +571,7 @@ class DynamoTokenWrapperHost:
             max_model_len=max_model_len,
             age_priority=age_priority,
             slow_session_log_s=slow_session_log_s,
+            prompt_affinity_subgroups=prompt_affinity_subgroups,
         )
 
     def start(self) -> str:
@@ -575,10 +596,12 @@ class DynamoTokenWrapperServer:
         request_timeout_s: Optional[float],
         age_priority: bool,
         slow_session_log_s: Optional[float] = None,
+        prompt_affinity_subgroups: Optional[int] = None,
         max_model_len: Optional[int] = None,
     ) -> None:
         self.dynamo_frontend_base_url = dynamo_frontend_base_url
         self.age_priority = age_priority
+        self.prompt_affinity_subgroups = prompt_affinity_subgroups
         self.slow_session_log_s = slow_session_log_s
         self._session_first_seen: dict[str, float] = {}
         # session id -> (calls, seconds inside model calls, prompt tokens,
@@ -658,11 +681,18 @@ class DynamoTokenWrapperServer:
                 first_seen = self._first_seen(session_id)
                 if self.age_priority:
                     self._apply_age_priority(prepared_body, first_seen)
+            router_session_id = session_id
+            if session_id and self.prompt_affinity_subgroups:
+                router_session_id = prompt_affinity_session_id(
+                    session_id,
+                    request_body.get("messages"),
+                    self.prompt_affinity_subgroups,
+                )
             call_start = time.time()
             status_code, response_body = await self._forward_chat_completion(
                 prepared_body,
                 authorization=request.headers.get("authorization"),
-                session_id=session_id,
+                session_id=router_session_id,
             )
             if session_id and self.slow_session_log_s:
                 self._log_slow_session(session_id, call_start, response_body)
