@@ -207,6 +207,10 @@ class DynamoCfg(BaseModel, extra="forbid"):
     # stalls the trainer, so the oldest conversations must not wait behind newer
     # ones. The engines must run with vllm_kwargs.scheduling_policy: priority.
     age_priority: bool = False
+    # Log every model call of a conversation older than this many seconds, with the
+    # time the conversation spent inside model calls and outside them. Use it to see
+    # whether a late conversation waits for the model or for tools. None turns it off.
+    slow_session_log_s: PositiveFloat | None = None
     worker_args: DynamoWorkerArgs
     frontend_args: DynamoFrontendArgs
     metrics_include_prefixes: list[str] | None

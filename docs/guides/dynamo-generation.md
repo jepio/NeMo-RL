@@ -225,6 +225,12 @@ of its first request (`nvext.agent_hints.priority`), and vLLM serves older
 conversations first. The wrapper needs `forward_session_id_as_conversation_id` to
 know the conversation.
 
+To see why a group is late, set `dynamo_cfg.slow_session_log_s` to a number of
+seconds. The wrapper then prints a `[SESSION-SLOW]` line for each model call of a
+conversation older than that, with `busy_s` (time in model calls) and `idle_s`
+(the rest of its age, for example tools). A large `busy_s` means the model is
+slow for that conversation. A large `idle_s` means the delay is outside the model.
+
 ### Prefill/decode disaggregation
 
 Use

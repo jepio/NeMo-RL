@@ -900,9 +900,9 @@ def test_age_priority_is_set_once_per_session_from_its_first_request(
     first = {"nvext": {"token_data": [1]}}
     second = {"nvext": {"token_data": [2]}}
     repeat = {}
-    server._apply_age_priority(first, "session-a")
-    server._apply_age_priority(second, "session-b")
-    server._apply_age_priority(repeat, "session-a")
+    server._apply_age_priority(first, server._first_seen("session-a"))
+    server._apply_age_priority(second, server._first_seen("session-b"))
+    server._apply_age_priority(repeat, server._first_seen("session-a"))
 
     assert first["nvext"]["agent_hints"]["priority"] == age_priority(1_790_000_000.0)
     assert second["nvext"]["agent_hints"]["priority"] == age_priority(1_790_000_050.0)
@@ -925,6 +925,33 @@ def test_age_priority_forgets_the_oldest_sessions_beyond_the_limit(monkeypatch) 
         age_priority=True,
     )
     for name in ("a", "b", "c"):
-        server._apply_age_priority({}, name)
+        server._first_seen(name)
 
     assert list(server._session_first_seen) == ["b", "c"]
+
+
+def test_slow_session_log_reports_model_time_and_idle_time(monkeypatch, capsys) -> None:
+    server = DynamoTokenWrapperServer(
+        dynamo_frontend_base_url="http://dynamo/v1",
+        tokenizer=_Tokenizer(),
+        tokenizer_chat_template_kwargs=None,
+        exclude_tools_when_tool_choice_none=True,
+        request_timeout_s=30,
+        age_priority=False,
+        slow_session_log_s=100,
+    )
+    module = sys.modules[DynamoTokenWrapperServer.__module__]
+    clock = iter([1000.0, 1090.0, 1150.0])
+    monkeypatch.setattr(module, "time", SimpleNamespace(time=lambda: next(clock)))
+
+    usage = {"usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+    server._first_seen("session-abc")  # t=1000
+    # A call from t=1050 to t=1090: the session is 90 s old, below the limit.
+    server._log_slow_session("session-abc", 1050.0, usage)
+    assert capsys.readouterr().out == ""
+    # A call from t=1090 to t=1150 (clock reads 1150): 150 s old, 100 s in the model.
+    server._log_slow_session("session-abc", 1090.0, usage)
+    out = capsys.readouterr().out
+    assert "[SESSION-SLOW] session=session-abc age_s=150 calls=2" in out
+    assert "busy_s=100 idle_s=50 last_call_s=60.0" in out
+    assert "prompt_tokens=10 completion_tokens=5" in out
