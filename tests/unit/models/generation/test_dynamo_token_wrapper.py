@@ -955,3 +955,4 @@ def test_slow_session_log_reports_model_time_and_idle_time(monkeypatch, capsys) 
     assert "[SESSION-SLOW] session=session-abc age_s=150 calls=2" in out
     assert "busy_s=100 idle_s=50 last_call_s=60.0" in out
     assert "prompt_tokens=10 completion_tokens=5" in out
+    assert "total_prompt_tokens=20 total_completion_tokens=10" in out

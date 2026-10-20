@@ -581,8 +581,9 @@ class DynamoTokenWrapperServer:
         self.age_priority = age_priority
         self.slow_session_log_s = slow_session_log_s
         self._session_first_seen: dict[str, float] = {}
-        # session id -> (calls, seconds inside model calls, end time of the last call)
-        self._session_activity: dict[str, tuple[int, float, float]] = {}
+        # session id -> (calls, seconds inside model calls, prompt tokens,
+        # completion tokens)
+        self._session_activity: dict[str, tuple[int, float, int, int]] = {}
         self.tokenizer = tokenizer
         self.tokenizer_chat_template_kwargs = tokenizer_chat_template_kwargs
         self.exclude_tools_when_tool_choice_none = exclude_tools_when_tool_choice_none
@@ -731,21 +732,32 @@ class DynamoTokenWrapperServer:
         a late conversation waits for the model or for something else.
         """
         now = time.time()
-        calls, busy_s, _ = self._session_activity.pop(session_id, (0, 0.0, 0.0))
+        usage = response_body.get("usage") or {}
+        calls, busy_s, prompt_tokens, completion_tokens = self._session_activity.pop(
+            session_id, (0, 0.0, 0, 0)
+        )
         calls, busy_s = calls + 1, busy_s + (now - call_start)
-        self._session_activity[session_id] = (calls, busy_s, now)
+        prompt_tokens += usage.get("prompt_tokens") or 0
+        completion_tokens += usage.get("completion_tokens") or 0
+        self._session_activity[session_id] = (
+            calls,
+            busy_s,
+            prompt_tokens,
+            completion_tokens,
+        )
         while len(self._session_activity) > _MAX_TRACKED_SESSIONS:
             del self._session_activity[next(iter(self._session_activity))]
         age_s = now - self._session_first_seen[session_id]
         if age_s < self.slow_session_log_s:
             return
-        usage = response_body.get("usage") or {}
         print(
             f"[SESSION-SLOW] session={session_id[:12]} age_s={age_s:.0f} calls={calls} "
             f"busy_s={busy_s:.0f} idle_s={age_s - busy_s:.0f} "
             f"last_call_s={now - call_start:.1f} "
             f"prompt_tokens={usage.get('prompt_tokens')} "
-            f"completion_tokens={usage.get('completion_tokens')}",
+            f"completion_tokens={usage.get('completion_tokens')} "
+            f"total_prompt_tokens={prompt_tokens} "
+            f"total_completion_tokens={completion_tokens}",
             flush=True,
         )
 
