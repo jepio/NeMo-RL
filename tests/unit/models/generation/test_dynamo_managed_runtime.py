@@ -1408,6 +1408,7 @@ def test_fixed_pool_splits_placement_groups_into_whole_node_engines() -> None:
     pool = object.__new__(FixedDynamoWorkerPool)
     pool._engine_world_size = 8
     pool._nodes_per_engine = 2
+    pool._engine_shapes = None
     groups = [SimpleNamespace(bundle_count=4) for _ in range(4)]
 
     engines = pool._engine_node_groups(groups)
@@ -1603,3 +1604,46 @@ def test_fixed_pool_starts_data_parallel_nodes_with_a_local_rank_count(
     assert [kwargs["nixl_port"] for kwargs in launch_kwargs] == [4100, 4100]
     assert pool._workers == [leader]
     assert pool._followers == [follower]
+
+
+def test_fixed_pool_places_engines_of_different_sizes_in_order() -> None:
+    from nemo_rl.models.generation.dynamo.worker_pool import EngineShape
+
+    pool = object.__new__(FixedDynamoWorkerPool)
+    pool._engine_shapes = (
+        EngineShape(world_size=16, nodes=4, data_parallel_size=16),
+        EngineShape(world_size=4, nodes=1, data_parallel_size=4),
+        EngineShape(world_size=4, nodes=1, data_parallel_size=4),
+    )
+    groups = [SimpleNamespace(bundle_count=4) for _ in range(6)]
+
+    engines = pool._engine_node_groups(groups)
+
+    assert [[pg for pg, _ in engine] for engine in engines] == [
+        groups[:4],
+        [groups[4]],
+        [groups[5]],
+    ]
+    assert engines[1][0][1] == [0, 1, 2, 3]
+    with pytest.raises(ValueError, match="hold more GPUs"):
+        pool._engine_node_groups([*groups, SimpleNamespace(bundle_count=4)])
+    with pytest.raises(ValueError, match="end before engine"):
+        pool._engine_node_groups(groups[:5])
+
+
+def test_fixed_pool_packs_small_engines_on_a_node_and_keeps_wide_ones_whole() -> None:
+    from nemo_rl.models.generation.dynamo.worker_pool import EngineShape
+
+    pool = object.__new__(FixedDynamoWorkerPool)
+    pool._engine_shapes = (
+        EngineShape(world_size=2, nodes=1, data_parallel_size=2),
+        EngineShape(world_size=2, nodes=1, data_parallel_size=2),
+        EngineShape(world_size=8, nodes=2, data_parallel_size=8),
+    )
+    groups = [SimpleNamespace(bundle_count=4) for _ in range(3)]
+
+    engines = pool._engine_node_groups(groups)
+
+    assert engines[0] == [(groups[0], [0, 1])]
+    assert engines[1] == [(groups[0], [2, 3])]
+    assert [pg for pg, _ in engines[2]] == groups[1:]

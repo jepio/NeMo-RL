@@ -1048,3 +1048,103 @@ def test_wire_safe_pickle_is_independent_of_a_patched_storage_loader(monkeypatch
 
     assert b"dummy_unpickler_module" in pickle.dumps(info)
     assert b"dummy_unpickler_module" not in pickle.dumps(wire)
+
+
+def _expert_metadata(num_experts=8, hidden=32, inter=16):
+    metadata = {}
+    for expert in range(num_experts):
+        for proj, shape in (
+            ("gate_proj", [inter, hidden]),
+            ("up_proj", [inter, hidden]),
+            ("down_proj", [hidden, inter]),
+        ):
+            metadata[f"model.layers.0.mlp.experts.{expert}.{proj}.weight"] = {
+                "shape": shape,
+                "dtype": "torch.bfloat16",
+            }
+    return metadata
+
+
+def test_build_refit_info_has_an_entry_per_layout_segment():
+    info = build_nccl_reshard_refit_info(
+        _expert_metadata(),
+        train_parallelism={"tp_size": 1, "ep_size": 4, "etp_size": 1, "pp_size": 1},
+        gen_parallelism={
+            "tp_size": 1,
+            "ep_size": 4,
+            "etp_size": 1,
+            "pp_size": 1,
+            # Two engines of 4 ranks, then one of 8 ranks with a wider EP.
+            "segments": [
+                {
+                    "tp_size": 1,
+                    "ep_size": 4,
+                    "etp_size": 1,
+                    "pp_size": 1,
+                    "world_size": 8,
+                },
+                {
+                    "tp_size": 1,
+                    "ep_size": 8,
+                    "etp_size": 1,
+                    "pp_size": 1,
+                    "world_size": 8,
+                },
+            ],
+        },
+        train_world_size=4,
+        gen_world_size=16,
+    )
+
+    entries = [
+        p
+        for layer in info["layer_names"]
+        for p in info["per_layer_params"][layer]
+        if p["name"].endswith("gate_proj.weight")
+    ]
+    assert len(entries) == 2
+    first, second = entries
+    # Gen ranks start after the 4 training ranks, one segment after the other.
+    assert first["dst_mesh_info"].mesh.flatten().tolist() == list(range(4, 12))
+    assert second["dst_mesh_info"].mesh.flatten().tolist() == list(range(12, 20))
+    # Experts split over 4 ranks in the first layout and over 8 in the second.
+    for entry in entries:
+        assert [p.dim for p in entry["dst_placements"] if isinstance(p, Shard)] == [0]
+    assert 4 in first["dst_mesh_info"].mesh.shape
+    assert 8 in second["dst_mesh_info"].mesh.shape
+    assert info["gen_world_size"] == 16
+
+
+def test_build_refit_info_rejects_layouts_that_do_not_cover_the_gen_ranks():
+    with pytest.raises(ValueError, match="do not cover"):
+        build_nccl_reshard_refit_info(
+            _dense_metadata(),
+            train_parallelism={"tp_size": 1, "ep_size": 1, "pp_size": 1},
+            gen_parallelism={
+                "tp_size": 1,
+                "ep_size": 1,
+                "pp_size": 1,
+                "segments": [{"tp_size": 1, "ep_size": 1, "world_size": 3}],
+            },
+            train_world_size=1,
+            gen_world_size=4,
+        )
+
+
+def test_build_refit_info_rejects_layouts_with_different_tensor_parallel_sizes():
+    with pytest.raises(ValueError, match="share the tensor-parallel size"):
+        build_nccl_reshard_refit_info(
+            _dense_metadata(),
+            train_parallelism={"tp_size": 1, "ep_size": 1, "pp_size": 1},
+            gen_parallelism={
+                "tp_size": 1,
+                "ep_size": 1,
+                "pp_size": 1,
+                "segments": [
+                    {"tp_size": 1, "ep_size": 1, "world_size": 2},
+                    {"tp_size": 2, "ep_size": 1, "world_size": 2},
+                ],
+            },
+            train_world_size=1,
+            gen_world_size=4,
+        )

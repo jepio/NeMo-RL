@@ -16,6 +16,7 @@
 
 from collections import Counter
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import ray
@@ -75,6 +76,21 @@ def _kv_event_port_for_node_slot(node_slot: int) -> int:
     return port
 
 
+@dataclass(frozen=True)
+class EngineShape:
+    """The size of one engine.
+
+    Attributes:
+        world_size: GPUs of the engine (tp * pp * dp).
+        nodes: whole nodes of the engine; 1 when it fits on one node.
+        data_parallel_size: data-parallel ranks of the engine.
+    """
+
+    world_size: int
+    nodes: int
+    data_parallel_size: int
+
+
 class FixedDynamoWorkerPool:
     """Reserve inference GPUs and launch one worker per model-parallel group.
 
@@ -102,6 +118,7 @@ class FixedDynamoWorkerPool:
         startup_timeout_s: float,
         nodes_per_engine: int,
         data_parallel_size: int,
+        engine_shapes: Sequence[EngineShape] | None = None,
     ) -> None:
         self._cluster = cluster
         self._config = config
@@ -112,6 +129,18 @@ class FixedDynamoWorkerPool:
         self._worker_roles = tuple(worker_roles)
         if not self._worker_roles:
             raise ValueError("Managed Dynamo requires at least one worker role.")
+        # One shape per engine, in the order of ``worker_roles``, when the roles use
+        # engines of different sizes. None means every engine has the size above.
+        self._engine_shapes = (
+            tuple(engine_shapes) if engine_shapes is not None else None
+        )
+        if self._engine_shapes is not None and len(self._engine_shapes) != len(
+            self._worker_roles
+        ):
+            raise ValueError(
+                f"{len(self._engine_shapes)} engine shapes for "
+                f"{len(self._worker_roles)} worker roles"
+            )
         self._manager_env = manager_env
         self._startup_timeout_s = startup_timeout_s
         # One leader per engine. Refit and health checks address only leaders.
@@ -139,6 +168,77 @@ class FixedDynamoWorkerPool:
             )
         )
 
+    def _shape(self, engine_index: int) -> EngineShape:
+        """Return the size of an engine."""
+        if self._engine_shapes is not None:
+            return self._engine_shapes[engine_index]
+        return EngineShape(
+            self._engine_world_size, self._nodes_per_engine, self._data_parallel_size
+        )
+
+    def _mixed_engine_node_groups(
+        self, placement_groups: list[Any]
+    ) -> list[list[tuple[Any, list[int]]]]:
+        """Split the placement groups into engines of different sizes, in order.
+
+        An engine that fits on one node takes the next GPUs of the current node. An
+        engine of several nodes takes whole nodes, so it must start on a fresh node.
+        """
+        engines: list[list[tuple[Any, list[int]]]] = []
+        node = 0
+        used = 0
+        for index, shape in enumerate(self._engine_shapes or ()):
+            if node >= len(placement_groups):
+                raise ValueError(
+                    f"The inference placement groups end before engine {index}."
+                )
+            if shape.nodes == 1:
+                placement_group = placement_groups[node]
+                if used + shape.world_size > placement_group.bundle_count:
+                    raise ValueError(
+                        f"Engine {index} needs {shape.world_size} GPUs but node "
+                        f"{node} has {placement_group.bundle_count - used} left."
+                    )
+                engines.append(
+                    [
+                        (
+                            placement_group,
+                            list(range(used, used + shape.world_size)),
+                        )
+                    ]
+                )
+                used += shape.world_size
+                if used == placement_group.bundle_count:
+                    node, used = node + 1, 0
+                continue
+            if used != 0:
+                raise ValueError(
+                    f"Engine {index} spans {shape.nodes} whole nodes but starts in "
+                    f"the middle of node {node}."
+                )
+            gpus_per_node = shape.world_size // shape.nodes
+            group = placement_groups[node : node + shape.nodes]
+            if len(group) != shape.nodes or any(
+                placement_group.bundle_count != gpus_per_node
+                for placement_group in group
+            ):
+                raise ValueError(
+                    f"Engine {index} needs {shape.nodes} nodes of {gpus_per_node} "
+                    "GPUs each."
+                )
+            engines.append(
+                [
+                    (placement_group, list(range(gpus_per_node)))
+                    for placement_group in group
+                ]
+            )
+            node += shape.nodes
+        if node != len(placement_groups) or used != 0:
+            raise ValueError(
+                "The inference placement groups hold more GPUs than the engines use."
+            )
+        return engines
+
     def _engine_node_groups(
         self, placement_groups: list[Any]
     ) -> list[list[tuple[Any, list[int]]]]:
@@ -149,6 +249,8 @@ class FixedDynamoWorkerPool:
             and the bundle indices of the engine on that node. Entry 0 is the
             leader node.
         """
+        if self._engine_shapes is not None and len(set(self._engine_shapes)) > 1:
+            return self._mixed_engine_node_groups(placement_groups)
         engines: list[list[tuple[Any, list[int]]]] = []
         if self._nodes_per_engine == 1:
             for pg_index, placement_group in enumerate(placement_groups):
@@ -218,6 +320,7 @@ class FixedDynamoWorkerPool:
                     f"the configured managed worker roles: {len(self._worker_roles)}"
                 )
             worker_role = self._worker_roles[group_index]
+            shape = self._shape(group_index)
             role_index = role_indices[worker_role]
             role_indices[worker_role] += 1
             group_name = f"{self._namespace}-dynamo-vllm-{worker_role}-{role_index}"
@@ -289,7 +392,7 @@ class FixedDynamoWorkerPool:
                 node_slot = engine_slots_by_node.get(node_ip, 0)
                 # A data-parallel engine uses one NIXL and KV-event port per rank,
                 # counted up from the port of its slot.
-                engine_slots_by_node[node_ip] = node_slot + self._data_parallel_size
+                engine_slots_by_node[node_ip] = node_slot + shape.data_parallel_size
                 system_ports = system_ports_by_node.setdefault(node_ip, set())
                 system_port = ray.get(
                     plan["reservations"][0].select_free_port.remote(
@@ -317,8 +420,8 @@ class FixedDynamoWorkerPool:
                         master_port=multi_node_master[1],
                         data_parallel_size_local=(
                             len(plan["cuda_devices"])
-                            // (self._engine_world_size // self._data_parallel_size)
-                            if self._data_parallel_size > 1
+                            // (shape.world_size // shape.data_parallel_size)
+                            if shape.data_parallel_size > 1
                             else None
                         ),
                     )

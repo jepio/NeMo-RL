@@ -923,3 +923,65 @@ def test_keep_running_requests_at_refit_is_off_by_default() -> None:
         DynamoConfig.model_validate(config).dynamo_cfg.keep_running_requests_at_refit
         is True
     )
+
+
+def _mixed_shape_config() -> dict:
+    config = _config()
+    config["vllm_cfg"]["tensor_parallel_size"] = 1
+    config["vllm_cfg"]["data_parallel_size"] = 4
+    config["vllm_cfg"]["expert_parallel_size"] = 4
+    config["dynamo_cfg"]["disaggregation"] = {
+        "prefill_workers": 4,
+        "decode_workers": 1,
+        "decode_vllm_kwargs": {"data_parallel_size": 16},
+    }
+    config["colocated"]["resources"] = {"gpus_per_node": 4, "num_nodes": 8}
+    return config
+
+
+def test_roles_can_differ_in_data_parallel_size() -> None:
+    validated = DynamoConfig.model_validate(_mixed_shape_config())
+
+    assert validated.role_data_parallel_size("prefill") == 4
+    assert validated.role_data_parallel_size("decode") == 16
+    assert validated.role_engine_world_size("decode") == 16
+    assert validated.managed_inference_world_size == 4 * 4 + 16
+    # Decode engines come first in refit rank order.
+    assert validated.disaggregated_engine_world_sizes() == [16, 4, 4, 4, 4]
+    assert validated.refit_layouts() == (
+        {"tp_size": 1, "ep_size": 16, "etp_size": 1, "pp_size": 1, "world_size": 16},
+        {"tp_size": 1, "ep_size": 4, "etp_size": 1, "pp_size": 1, "world_size": 16},
+    )
+
+
+def test_roles_of_the_same_size_have_no_separate_layouts() -> None:
+    config = _mixed_shape_config()
+    del config["dynamo_cfg"]["disaggregation"]["decode_vllm_kwargs"]
+    config["colocated"]["resources"] = {"gpus_per_node": 4, "num_nodes": 5}
+
+    validated = DynamoConfig.model_validate(config)
+
+    assert validated.refit_layouts() is None
+    assert validated.managed_inference_world_size == 5 * 4
+
+
+def test_role_data_parallel_size_sets_the_engine_argv() -> None:
+    config = _mixed_shape_config()
+    validated = DynamoConfig.model_validate(config)
+    common = {
+        "model_name": "model",
+        "namespace": "nemo-rl-1",
+        "seed": 7,
+        "vllm_cfg": config["vllm_cfg"],
+        "vllm_kwargs": {},
+        "dynamo_cfg": validated.dynamo_cfg,
+    }
+    prefill_argv = build_dynamo_vllm_argv(
+        **common, worker_role="prefill", kv_event_port=4201
+    )
+    decode_argv = build_dynamo_vllm_argv(
+        **common, worker_role="decode", kv_event_port=None
+    )
+
+    assert _flag_value(prefill_argv, "--data-parallel-size") == "4"
+    assert _flag_value(decode_argv, "--data-parallel-size") == "16"

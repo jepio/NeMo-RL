@@ -291,6 +291,7 @@ class DynamoGeneration(GenerationInterface):
         self._dynamo_frontend_base_url = ""
         self.dp_openai_server_base_urls: list[Optional[str]] = []
         self._refit_channel: DynamoRefitChannel | None = None
+        self._refit_layouts: tuple[dict[str, int], ...] | None = None
         self._metrics_sampler: DynamoMetricsSampler | None = None
         try:
             self._managed_runtime.start()
@@ -302,7 +303,9 @@ class DynamoGeneration(GenerationInterface):
                 engine_world_size=validated_config.engine_world_size,
                 control_timeout_s=dynamo_cfg.control_timeout_s,
                 validate_workers=self._managed_runtime.validate_workers,
+                engine_world_sizes=validated_config.disaggregated_engine_world_sizes(),
             )
+            self._refit_layouts = validated_config.refit_layouts()
             self._configure_mtp_drafter()
 
             if expose_http_server:
@@ -404,9 +407,12 @@ class DynamoGeneration(GenerationInterface):
     def get_refit_fleet_shape(self) -> RefitFleetShape:
         """One DP shard per Dynamo engine, each with TP x PP refit ranks."""
         channel = self._require_refit_channel()
+        sizes = channel.engine_world_sizes
         return RefitFleetShape(
             dp_size=channel.num_engines,
             total_gen_workers=channel.inference_world_size,
+            workers_by_shard=sizes if len(set(sizes)) > 1 else None,
+            layouts=self._refit_layouts,
         )
 
     def _require_refit_channel(self) -> DynamoRefitChannel:
@@ -503,6 +509,7 @@ class DynamoGeneration(GenerationInterface):
         self._managed_runtime = None
         self._metrics_sampler = None
         self._refit_channel = state["_refit_channel"]
+        self._refit_layouts = validated_config.refit_layouts()
 
     def _completion_url(self) -> str:
         base_url = self._dynamo_frontend_base_url

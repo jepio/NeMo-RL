@@ -244,7 +244,7 @@ class DynamoVllmWorker:  # pragma: no cover
                 config["model_name"],
                 vllm_cfg,
                 vllm_kwargs,
-                validated_config.engine_world_size,
+                validated_config.role_engine_world_size(worker_role),
             )
         configured_env = dict(vllm_cfg.get("env_vars") or {})
         managed_worker_env = {

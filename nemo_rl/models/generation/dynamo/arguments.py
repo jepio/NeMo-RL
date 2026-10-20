@@ -46,8 +46,9 @@ class MultiNodeEngine:
 
 
 # vllm_cfg settings that a prefill or decode role may replace through
-# disaggregation.{prefill,decode}_vllm_kwargs. Parallelism and dtype stay shared.
-_ROLE_OVERRIDABLE_CFG_KEYS = ("gpu_memory_utilization",)
+# disaggregation.{prefill,decode}_vllm_kwargs. The data-parallel size gives a role
+# engines of its own size. Tensor and pipeline parallelism and dtype stay shared.
+_ROLE_OVERRIDABLE_CFG_KEYS = ("gpu_memory_utilization", "data_parallel_size")
 
 _MANAGED_FLAGS = {
     "--data-parallel-size-local",

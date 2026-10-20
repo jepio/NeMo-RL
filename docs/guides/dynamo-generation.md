@@ -284,8 +284,11 @@ example, a prefill engine never decodes, so it can take a larger prefill chunk:
 GPU count is:
 
 ```text
-(prefill_workers + decode_workers) * tensor_parallel_size * pipeline_parallel_size
+prefill_workers * prefill engine GPUs + decode_workers * decode engine GPUs
 ```
+
+Both engine sizes are `tensor_parallel_size * pipeline_parallel_size *
+data_parallel_size` unless a role sets its own `data_parallel_size` (see below).
 
 A TP times PP engine that does not fit on one node must use whole nodes: TP8
 needs two four-GPU nodes, and a larger expert-parallel group lets each GPU hold
@@ -308,6 +311,37 @@ leader and the other nodes run headless workers that join through vLLM's
 data-parallel launch (`--data-parallel-address`, `--data-parallel-rpc-port`,
 `--data-parallel-start-rank`). All-to-all between the experts of such an engine
 uses `vllm_kwargs.all2all_backend`; on GB300 try `flashinfer_nvlink_one_sided`.
+
+#### Engines of different shapes per role
+
+Prefill and decode engines may differ in their data-parallel size, for example
+four 4-GPU prefill engines and one 16-GPU decode engine with expert parallelism
+over all 16 ranks. Set the shared shape in `vllm_cfg`, and the shape of a role in
+its kwargs:
+
+```yaml
+policy:
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 1
+      data_parallel_size: 4        # prefill engines
+      expert_parallel_size: 4
+    dynamo_cfg:
+      disaggregation:
+        prefill_workers: 4
+        decode_workers: 1
+        decode_vllm_kwargs:
+          data_parallel_size: 16   # one decode engine of 16 GPUs
+```
+
+Tensor and pipeline parallel sizes stay shared. The expert-parallel size of a role
+is `tensor_parallel_size * data_parallel_size` of that role. The `nccl_reshard`
+weight update then builds one reshard layout for each role. Every parameter has one
+entry per layout in the refit plan, and the engines of one role take part in the
+entries of the other role without holding a part of the tensor. A decode engine
+that spans several nodes needs those nodes to be in one NVLink domain. NIXL moves
+the KV between engines of different data-parallel sizes, because both use the same
+tensor-parallel size.
 
 NeMo RL manages `--disaggregation-mode`, the NIXL connector, NIXL side-channel
 ports, and prefill KV-event ports. Do not set these values in

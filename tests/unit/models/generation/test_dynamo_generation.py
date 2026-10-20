@@ -1525,3 +1525,46 @@ def test_speculative_lookahead_stops_short_of_the_context_limit(monkeypatch) -> 
     # 64 - 40 - (3 + 1): the drafter must not read past max_model_len.
     assert generation._allowed_new_tokens(input_length=40) == 20
     assert generation._allowed_new_tokens(input_length=62) == 1
+
+
+def test_refit_channel_places_engines_of_different_sizes_after_each_other() -> None:
+    from nemo_rl.weight_sync.membership import desired_membership
+
+    workers = [
+        {"instance_id": name, "system_url": f"http://{name}:4000", "role": role}
+        for name, role in (
+            ("d0", "decode"),
+            ("p0", "prefill"),
+            ("p1", "prefill"),
+        )
+    ]
+    channel = DynamoRefitChannel(
+        workers,
+        engine_world_size=4,
+        control_timeout_s=10,
+        engine_world_sizes=[16, 4, 4],
+    )
+
+    assert channel.inference_world_size == 24
+    membership = channel.full_fleet_membership(train_world_size=8)
+    assert membership.shard_prefixes == {0: 0, 1: 16, 2: 20}
+    assert membership.world_size == 32
+    channel.check_full_fleet(membership)
+    # A fleet of equal engines is not accepted for these engines.
+    uniform = desired_membership(
+        absent_shards=[],
+        dp_size=3,
+        total_gen_workers=24,
+        train_world_size=8,
+    )
+    with pytest.raises(NotImplementedError, match="fixed worker fleet"):
+        channel.check_full_fleet(uniform)
+    assert channel.client_copy().engine_world_sizes == (16, 4, 4)
+
+    with pytest.raises(ValueError, match="engine sizes"):
+        DynamoRefitChannel(
+            workers,
+            engine_world_size=4,
+            control_timeout_s=10,
+            engine_world_sizes=[16, 4],
+        )

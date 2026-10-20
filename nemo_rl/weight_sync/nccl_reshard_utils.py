@@ -926,14 +926,17 @@ def build_nccl_reshard_refit_info(
     # Expert params follow the generation backend's EP/ETP layout. vLLM uses
     # TP for experts when EP=1, whereas Megatron can keep ETP=1 and replicate
     # experts across its ordinary TP ranks.
-    gen_tp = gen_parallelism.get("tp_size", 1) or 1
-    gen_ep = gen_parallelism.get("ep_size", 1) or 1
-    # Bind to a definite int: _build_dst_meshes closes over this, and a
-    # narrowed-in-place Optional would still read as int | None inside it.
-    gen_etp = gen_parallelism.get("etp_size", gen_tp if gen_ep == 1 else 1)
-    gen_pp = gen_parallelism.get("pp_size", 1) or 1
+    def _layout_parts(layout: dict[str, int]) -> tuple[int, int, int, int]:
+        tp = layout.get("tp_size", 1) or 1
+        ep = layout.get("ep_size", 1) or 1
+        # Bind to definite ints: _build_dst_meshes closes over them, and a
+        # narrowed-in-place Optional would still read as int | None inside it.
+        etp = layout.get("etp_size", tp if ep == 1 else 1)
+        pp = layout.get("pp_size", 1) or 1
+        return tp, ep, etp, pp
 
-    def _build_dst_meshes(num_gpus: int, rank_offset: int):
+    def _build_dst_meshes(layout: dict[str, int], num_gpus: int, rank_offset: int):
+        gen_tp, gen_ep, gen_etp, gen_pp = _layout_parts(layout)
         non_expert = build_mesh_info(
             num_gpus,
             rank_offset=rank_offset,
@@ -950,6 +953,38 @@ def build_nccl_reshard_refit_info(
         )
         return non_expert, expert
 
+    # Gen (dst) side.  Non-expert params are TP-sharded across the gen ranks.
+    # Expert params follow the generation backend's EP/ETP layout. vLLM uses
+    # TP for experts when EP=1, whereas Megatron can keep ETP=1 and replicate
+    # experts across its ordinary TP ranks. Engines of different roles can run
+    # different layouts: ``segments`` lists them in refit rank order, each with
+    # the number of gen ranks that use it, and every parameter then gets one entry
+    # per segment, with the destination mesh of that segment.
+    segments = gen_parallelism.get("segments") or [
+        {**gen_parallelism, "world_size": gen_world_size}
+    ]
+    if sum(int(segment["world_size"]) for segment in segments) != gen_world_size:
+        raise ValueError(
+            f"nccl_reshard layouts {segments} do not cover gen_world_size="
+            f"{gen_world_size}"
+        )
+    gen_tp = _layout_parts(segments[0])[0]
+    if any(_layout_parts(segment)[0] != gen_tp for segment in segments):
+        raise ValueError(
+            "nccl_reshard layouts of different roles must share the tensor-parallel "
+            f"size: {segments}"
+        )
+
+    def _segment_meshes(first_gen_rank: int):
+        """Destination meshes of every segment, the first gen rank given."""
+        meshes = []
+        offset = first_gen_rank
+        for segment in segments:
+            world = int(segment["world_size"])
+            meshes.append(_build_dst_meshes(segment, world, offset))
+            offset += world
+        return meshes
+
     if use_per_stage:
         # Per-PP-stage meshes: within each sub-group, train ranks are
         # 0..train_ranks_per_stage-1 and gen ranks follow immediately after.
@@ -965,26 +1000,19 @@ def build_nccl_reshard_refit_info(
             )
 
         # dst mesh: gen ranks start at train_ranks_per_stage within each sub-group
-        dst_non_expert, dst_expert = _build_dst_meshes(
-            gen_world_size, rank_offset=train_ranks_per_stage
-        )
+        dst_segment_meshes = _segment_meshes(train_ranks_per_stage)
     else:
         # Single global mesh pair (PP=1 or no per-stage mapping)
         (non_expert_mesh, non_expert_dim_map), (expert_mesh, expert_dim_map) = (
             _build_train_src_meshes(train_world_size, rank_offset=0, stage_pp=pp_size)
         )
-        dst_non_expert, dst_expert = _build_dst_meshes(
-            gen_world_size, rank_offset=train_world_size
-        )
+        dst_segment_meshes = _segment_meshes(train_world_size)
 
     per_layer_params: dict[str, list] = OrderedDict()
     for name, meta in state_dict_metadata.items():
         layer = _extract_layer_name(name)
         ndim = len(meta["shape"])
         expert = is_expert_param(name)
-        # Pick the gen (dst) mesh: experts go to the EP/TP-expert mesh, all other
-        # params to the TP non-expert mesh (identical when gen EP is off).
-        dst_mesh, dst_dim_map = dst_expert if expert else dst_non_expert
 
         if use_per_stage:
             # Guaranteed non-None when use_per_stage (asserted above); narrow it
@@ -997,45 +1025,45 @@ def build_nccl_reshard_refit_info(
                     f"layer_prefix mismatch reaches here."
                 )
             stage = layer_to_pp_stage[layer]
-            stage_src_mesh, stage_src_dim_map = (
+            this_src_mesh, this_src_dim_map = (
                 per_stage_src_expert[stage]
                 if expert
                 else per_stage_src_nonexpert[stage]
             )
-            info = {
-                "name": name,
-                "global_shape": tuple(meta["shape"]),
-                "dtype": meta["dtype"],
-                "pp_stage": stage,
-                "src_mesh_info": stage_src_mesh,
-                "src_placements": get_placements(name, stage_src_dim_map, ndim),
-                "dst_mesh_info": dst_mesh,
-                "dst_placements": get_placements(name, dst_dim_map, ndim),
-            }
+            stage_fields: dict[str, Any] = {"pp_stage": stage}
         else:
             this_src_mesh, this_src_dim_map = (
                 (expert_mesh, expert_dim_map)
                 if expert
                 else (non_expert_mesh, non_expert_dim_map)
             )
+            stage_fields = {}
+
+        # One entry per layout segment. Every gen rank runs all of them in this
+        # order and takes part in the entries of its own segment only.
+        for dst_non_expert, dst_expert in dst_segment_meshes:
+            # Pick the gen (dst) mesh: experts go to the EP/TP-expert mesh, all
+            # other params to the TP non-expert mesh (identical when gen EP is off).
+            dst_mesh, dst_dim_map = dst_expert if expert else dst_non_expert
             info = {
                 "name": name,
                 "global_shape": tuple(meta["shape"]),
                 "dtype": meta["dtype"],
+                **stage_fields,
                 "src_mesh_info": this_src_mesh,
                 "src_placements": get_placements(name, this_src_dim_map, ndim),
                 "dst_mesh_info": dst_mesh,
                 "dst_placements": get_placements(name, dst_dim_map, ndim),
             }
 
-        # Propagate the grouped-expert projection tag (gate_proj/up_proj/
-        # down_proj) so the train side stacks the matching per-expert tensors
-        # (_group_experts) and the gen backend maps the grouped HF param into
-        # its own fused layout (w13/w2).
-        if "grouped_expert_proj" in meta:
-            info["grouped_expert_proj"] = meta["grouped_expert_proj"]
+            # Propagate the grouped-expert projection tag (gate_proj/up_proj/
+            # down_proj) so the train side stacks the matching per-expert tensors
+            # (_group_experts) and the gen backend maps the grouped HF param into
+            # its own fused layout (w13/w2).
+            if "grouped_expert_proj" in meta:
+                info["grouped_expert_proj"] = meta["grouped_expert_proj"]
 
-        per_layer_params.setdefault(layer, []).append(info)
+            per_layer_params.setdefault(layer, []).append(info)
 
     return {
         "layer_names": list(per_layer_params.keys()),

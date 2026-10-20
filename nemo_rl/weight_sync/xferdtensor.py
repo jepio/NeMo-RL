@@ -17,6 +17,7 @@
 import logging
 import os
 from contextlib import nullcontext
+from typing import Optional
 
 import torch
 from torch.distributed._tensor import Shard
@@ -54,16 +55,30 @@ class DTensorRef:
     """
 
     def __init__(
-        self, local_tensor: torch.Tensor, global_shape, dtype=None, device=None
+        self,
+        local_tensor: Optional[torch.Tensor],
+        global_shape,
+        dtype=None,
+        device=None,
     ):
+        # ``local_tensor`` is None on a rank that takes part in a transfer without
+        # holding a shard of the tensor. It then needs ``dtype`` and ``device``.
         self._local_tensor = local_tensor
         self.shape = (
             torch.Size(global_shape)
             if not isinstance(global_shape, torch.Size)
             else global_shape
         )
+        if local_tensor is None and (dtype is None or device is None):
+            raise ValueError(
+                "A DTensorRef without a local tensor needs dtype and device."
+            )
         self.dtype = dtype if dtype is not None else local_tensor.dtype
         self.device = device if device is not None else local_tensor.device
+
+    def to_local(self) -> Optional[torch.Tensor]:
+        """Return the local shard, or None on a rank without one."""
+        return self._local_tensor
 
 
 # ===========================================================

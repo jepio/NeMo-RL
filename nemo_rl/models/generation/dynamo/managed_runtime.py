@@ -48,7 +48,10 @@ from nemo_rl.models.generation.dynamo.venv import (
     get_dynamo_python,
     get_dynamo_service_executable,
 )
-from nemo_rl.models.generation.dynamo.worker_pool import FixedDynamoWorkerPool
+from nemo_rl.models.generation.dynamo.worker_pool import (
+    EngineShape,
+    FixedDynamoWorkerPool,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -76,37 +79,51 @@ class ManagedDynamoRuntime:
         self._dynamo_cfg = validated_config.dynamo_cfg
         self._engine_world_size = validated_config.engine_world_size
         gpus_per_node = cluster.num_gpus_per_node
-        if self._engine_world_size <= gpus_per_node:
-            self._nodes_per_engine = 1
-        elif self._engine_world_size % gpus_per_node == 0:
-            # The ranks of one engine span whole nodes: a leader node and headless
-            # nodes that host vLLM workers only.
-            self._nodes_per_engine = self._engine_world_size // gpus_per_node
-        else:
-            raise ValueError(
-                "Managed Dynamo engines larger than one node must use whole nodes: "
-                f"tp*pp*dp={self._engine_world_size} is not a multiple of "
-                f"cluster.num_gpus_per_node={gpus_per_node}"
-            )
+
+        def engine_shape(world_size: int, data_parallel_size: int) -> EngineShape:
+            if world_size <= gpus_per_node:
+                nodes = 1
+            elif world_size % gpus_per_node == 0:
+                # The ranks of one engine span whole nodes: a leader node and
+                # headless nodes that host vLLM workers only.
+                nodes = world_size // gpus_per_node
+            else:
+                raise ValueError(
+                    "Managed Dynamo engines larger than one node must use whole "
+                    f"nodes: tp*pp*dp={world_size} is not a multiple of "
+                    f"cluster.num_gpus_per_node={gpus_per_node}"
+                )
+            tp_pp = world_size // data_parallel_size
+            if data_parallel_size > 1 and nodes > 1 and gpus_per_node % tp_pp != 0:
+                raise ValueError(
+                    "A data-parallel rank of a multi-node Managed Dynamo engine "
+                    f"must fit on one node: tp*pp={tp_pp} does not divide "
+                    f"cluster.num_gpus_per_node={gpus_per_node}"
+                )
+            return EngineShape(world_size, nodes, data_parallel_size)
+
         self._data_parallel_size = validated_config.vllm_cfg.data_parallel_size
-        tp_pp = self._engine_world_size // self._data_parallel_size
-        if (
-            self._data_parallel_size > 1
-            and self._nodes_per_engine > 1
-            and gpus_per_node % tp_pp != 0
-        ):
-            raise ValueError(
-                "A data-parallel rank of a multi-node Managed Dynamo engine must fit "
-                f"on one node: tp*pp={tp_pp} does not divide "
-                f"cluster.num_gpus_per_node={gpus_per_node}"
+        default_shape = engine_shape(self._engine_world_size, self._data_parallel_size)
+        self._nodes_per_engine = default_shape.nodes
+        # Engines of different roles can differ in their data-parallel size.
+        role_shapes = {
+            role: engine_shape(
+                validated_config.role_engine_world_size(role),
+                validated_config.role_data_parallel_size(role),
             )
+            for role in ("prefill", "decode")
+        }
+        mixed_shapes = any(shape != default_shape for shape in role_shapes.values())
         cluster_world_size = cluster.world_size()
-        if cluster_world_size % self._engine_world_size != 0:
+        if (
+            self._dynamo_cfg.disaggregation is None or not mixed_shapes
+        ) and cluster_world_size % self._engine_world_size != 0:
             raise ValueError(
                 "Managed Dynamo inference GPUs must be divisible by TP * PP: "
                 f"gpus={cluster_world_size}, tp_pp={self._engine_world_size}"
             )
         disaggregation = self._dynamo_cfg.disaggregation
+        self._engine_shapes: list[EngineShape] | None = None
         self._worker_roles: list[DynamoWorkerRole]
         if disaggregation is None:
             self._worker_roles = []
@@ -128,6 +145,11 @@ class ManagedDynamoRuntime:
                 self._worker_roles.append("decode")
             for _ in range(disaggregation.prefill_workers):
                 self._worker_roles.append("prefill")
+            if mixed_shapes:
+                self._engine_shapes = [
+                    role_shapes[role]
+                    for role in self._worker_roles  # type: ignore[index]
+                ]
             # Keys are Dynamo component names, not worker roles: decode and
             # aggregated workers register as "backend"; prefill as "prefill".
             self._expected_components = {
@@ -230,6 +252,7 @@ class ManagedDynamoRuntime:
                 startup_timeout_s=self._dynamo_cfg.startup_timeout_s,
                 nodes_per_engine=self._nodes_per_engine,
                 data_parallel_size=self._data_parallel_size,
+                engine_shapes=self._engine_shapes,
             )
             self._pool.start()
             self._start_frontend()

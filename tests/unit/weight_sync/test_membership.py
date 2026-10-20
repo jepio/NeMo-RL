@@ -179,3 +179,42 @@ class TestDesiredMembership:
     def test_losing_everyone_is_refused(self):
         with pytest.raises(NoSurvivingShards):
             self._desired([0, 1, 2, 3])
+
+
+class TestShardsOfDifferentSizes:
+    """Prefill and decode engines can differ in size, as in a wide decode engine."""
+
+    def test_prefixes_follow_the_sizes_of_the_shards(self):
+        plan = plan_refit_membership(
+            surviving_shards=[0, 1, 2, 3, 4],
+            dp_size=5,
+            total_gen_workers=32,
+            train_world_size=8,
+            workers_by_shard=(16, 4, 4, 4, 4),
+        )
+
+        assert plan.shard_prefixes == {0: 0, 1: 16, 2: 20, 3: 24, 4: 28}
+        assert plan.world_size == 40
+        assert plan.workers_by_shard == (16, 4, 4, 4, 4)
+
+    def test_survivors_are_compacted_with_their_own_sizes(self):
+        plan = plan_refit_membership(
+            surviving_shards=[0, 2],
+            dp_size=3,
+            total_gen_workers=24,
+            train_world_size=8,
+            workers_by_shard=(16, 4, 4),
+        )
+
+        assert plan.shard_prefixes == {0: 0, 2: 16}
+        assert plan.world_size == 8 + 20
+
+    def test_sizes_that_do_not_add_up_are_rejected(self):
+        with pytest.raises(ValueError, match="does not match"):
+            plan_refit_membership(
+                surviving_shards=[0, 1],
+                dp_size=2,
+                total_gen_workers=32,
+                train_world_size=8,
+                workers_by_shard=(16, 8),
+            )

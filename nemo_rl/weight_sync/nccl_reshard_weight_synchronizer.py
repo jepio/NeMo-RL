@@ -164,12 +164,19 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             vllm_cfg = generation_cfg.get("vllm_cfg", {})
             tp_size = vllm_cfg.get("tensor_parallel_size", 1)
             ep_size = vllm_cfg.get("expert_parallel_size", 1)
-            return {
+            parallelism = {
                 "tp_size": tp_size,
                 "ep_size": ep_size,
                 "etp_size": tp_size if ep_size == 1 else 1,
                 "pp_size": vllm_cfg.get("pipeline_parallel_size", 1),
             }
+            if generation_cfg["backend"] == "dynamo":
+                shape = self._generation.get_refit_fleet_shape()
+                if shape is not None and shape.layouts is not None:
+                    # Engines of different roles run different layouts. The plan
+                    # covers them one after the other, in refit rank order.
+                    parallelism["segments"] = [dict(layout) for layout in shape.layouts]
+            return parallelism
         if generation_cfg["backend"] == "megatron":
             # Resolve through the same merge the generation model is built from,
             # so the reshard mesh cannot drift from the layout MCore actually
@@ -266,6 +273,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             dp_size=shape.dp_size,
             total_gen_workers=shape.total_gen_workers,
             train_world_size=train_world_size,
+            workers_by_shard=shape.workers_by_shard,
         )
 
     def init_communicator(self) -> None:

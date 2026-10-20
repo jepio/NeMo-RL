@@ -198,6 +198,16 @@ def _local_shard_slices(param_info: dict[str, Any], rank: int) -> tuple[slice, .
     )
 
 
+def _mesh_contains_rank(mesh_info: Any, rank: int) -> bool:
+    """Return whether a rank belongs to a destination mesh of the refit plan."""
+    mesh_tensor = getattr(mesh_info, "mesh", None)
+    if mesh_tensor is None:
+        mesh_tensor = getattr(mesh_info, "_mesh", None)
+    if mesh_tensor is None:
+        raise ValueError("Destination DeviceMesh does not expose mesh ranks.")
+    return bool((mesh_tensor == rank).any())
+
+
 class _IPCWeightManifest:
     """Validate an IPC stream against its prepared state-dict manifest."""
 
@@ -1880,11 +1890,18 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
         # Get dict of vllm_param and merged_slice for each hf_name
         vllm_param_map_and_slices = self._build_hf_to_gen_backend_mapping(refit_info)
-        param_info_by_name = {
-            param_info["name"]: param_info
-            for layer_name in refit_info["layer_names"]
-            for param_info in refit_info["per_layer_params"][layer_name]
-        }
+        # A plan for engines of different layouts holds one entry per layout for
+        # each parameter. This rank takes the entry whose destination mesh holds it.
+        pp_comm_groups = self.pp_comm_groups
+        param_info_by_name = {}
+        for layer_name in refit_info["layer_names"]:
+            for param_info in refit_info["per_layer_params"][layer_name]:
+                if pp_comm_groups is not None and not _mesh_contains_rank(
+                    param_info["dst_mesh_info"],
+                    pp_comm_groups[param_info.get("pp_stage", 0)].rank,
+                ):
+                    continue
+                param_info_by_name[param_info["name"]] = param_info
         vllm_params = dict(self.model_runner.model.named_parameters())
         vllm_names_by_id = {id(param): name for name, param in vllm_params.items()}
         unquantized_trtllm_param_ids = self._unquantized_flashinfer_trtllm_param_ids()
@@ -2175,6 +2192,27 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
 
         def _recv_one_param(param_info, group, stream):
+            if not _mesh_contains_rank(param_info["dst_mesh_info"], group.rank):
+                # The entry is for engines of another layout. This rank still
+                # joins the transfer, because the reshard splits the communicator
+                # collectively, but it holds no part of the tensor.
+                wire_dtype = _STR_TO_DTYPE[str(param_info["dtype"])]
+                xferdtensor(
+                    None,
+                    param_info["src_mesh_info"],
+                    param_info["src_placements"],
+                    DTensorRef(
+                        None,
+                        param_info["global_shape"],
+                        dtype=wire_dtype,
+                        device=torch.device("cuda", torch.cuda.current_device()),
+                    ),
+                    param_info["dst_mesh_info"],
+                    param_info["dst_placements"],
+                    group,
+                    stream,
+                )
+                return
             # Coverage guard: every bulk param must have a spec; a missing entry
             # would silently discard its weights.
             spec = self.hf_to_local_param_map.get(param_info["name"])

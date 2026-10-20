@@ -177,7 +177,12 @@ class DynamoDisaggregationConfig(BaseModel, extra="forbid"):
             ``policy.generation.vllm_kwargs`` for prefill engines only. A prefill
             engine never decodes, so it can use a larger batched-token budget than
             a decode engine, for example ``{max_num_batched_tokens: 32768}``. The
-            ``gpu_memory_utilization`` of ``vllm_cfg`` can be replaced here too.
+            ``gpu_memory_utilization`` and ``data_parallel_size`` of ``vllm_cfg``
+            can be replaced here too. With ``data_parallel_size`` the engines of a
+            role have their own size: the expert-parallel size of a role is
+            ``tensor_parallel_size * data_parallel_size``, and the weight update
+            builds one reshard layout for each role. Tensor and pipeline parallel
+            sizes stay shared.
         decode_vllm_kwargs: The same, for decode engines only.
     """
 
@@ -386,6 +391,81 @@ class DynamoConfig(BaseModel, extra="allow"):
             * self.vllm_cfg.data_parallel_size
         )
 
+    def role_data_parallel_size(self, role: str) -> int:
+        """Return the data-parallel ranks of an engine of a role.
+
+        A prefill or decode engine may replace the shared ``data_parallel_size``
+        through ``disaggregation.{prefill,decode}_vllm_kwargs``. This is how a fleet
+        runs, for example, small data-parallel prefill engines and one wide decode
+        engine with expert parallelism over all of its ranks.
+        """
+        disaggregation = self.dynamo_cfg.disaggregation
+        if disaggregation is not None and role in ("prefill", "decode"):
+            override = getattr(disaggregation, f"{role}_vllm_kwargs").get(
+                "data_parallel_size"
+            )
+            if override is not None:
+                return int(override)
+        return self.vllm_cfg.data_parallel_size
+
+    def role_engine_world_size(self, role: str) -> int:
+        """Return the GPUs of an engine of a role."""
+        return (
+            self.vllm_cfg.tensor_parallel_size
+            * self.vllm_cfg.pipeline_parallel_size
+            * self.role_data_parallel_size(role)
+        )
+
+    def disaggregated_engine_world_sizes(self) -> list[int] | None:
+        """Return the GPUs of each engine in refit rank order, or None if unmanaged.
+
+        Decode engines come first and prefill engines after them, the order of the
+        managed runtime and the refit channel.
+        """
+        disaggregation = self.dynamo_cfg.disaggregation
+        if disaggregation is None:
+            return None
+        return [
+            self.role_engine_world_size("decode")
+        ] * disaggregation.decode_workers + [
+            self.role_engine_world_size("prefill")
+        ] * disaggregation.prefill_workers
+
+    def refit_layouts(self) -> tuple[dict[str, int], ...] | None:
+        """Return the reshard layout of each role in refit rank order.
+
+        None when prefill and decode engines have the same size, so that one layout
+        describes the whole fleet. Otherwise one entry for the decode engines and
+        one for the prefill engines, each with the refit ranks of its engines. The
+        expert-parallel size of a role is ``tp * dp`` of that role, as vLLM sets it,
+        or 1 when expert parallelism is off.
+        """
+        disaggregation = self.dynamo_cfg.disaggregation
+        if disaggregation is None or self.role_engine_world_size(
+            "decode"
+        ) == self.role_engine_world_size("prefill"):
+            return None
+        tp_size = self.vllm_cfg.tensor_parallel_size
+        expert_parallel = self.vllm_cfg.expert_parallel_size != 1
+        layouts = []
+        for role, workers in (
+            ("decode", disaggregation.decode_workers),
+            ("prefill", disaggregation.prefill_workers),
+        ):
+            ep_size = (
+                tp_size * self.role_data_parallel_size(role) if expert_parallel else 1
+            )
+            layouts.append(
+                {
+                    "tp_size": tp_size,
+                    "ep_size": ep_size,
+                    "etp_size": tp_size if ep_size == 1 else 1,
+                    "pp_size": self.vllm_cfg.pipeline_parallel_size,
+                    "world_size": workers * self.role_engine_world_size(role),
+                }
+            )
+        return tuple(layouts)
+
     @property
     def managed_worker_count(self) -> int | None:
         """Return the configured P/D engine count, or None for aggregated mode."""
@@ -397,10 +477,12 @@ class DynamoConfig(BaseModel, extra="allow"):
     @property
     def managed_inference_world_size(self) -> int | None:
         """Return the configured P/D GPU count, or None for aggregated mode."""
-        worker_count = self.managed_worker_count
-        if worker_count is None:
+        disaggregation = self.dynamo_cfg.disaggregation
+        if disaggregation is None:
             return None
-        return worker_count * self.engine_world_size
+        return disaggregation.prefill_workers * self.role_engine_world_size(
+            "prefill"
+        ) + disaggregation.decode_workers * self.role_engine_world_size("decode")
 
     @model_validator(mode="after")
     def _validate_backend_boundary(self) -> "DynamoConfig":
@@ -452,7 +534,8 @@ class DynamoConfig(BaseModel, extra="allow"):
             if configured_gpus != expected_gpus:
                 raise ValueError(
                     "Dynamo disaggregation requires inference GPUs to equal "
-                    "(prefill_workers + decode_workers) * TP * PP: "
+                    "prefill_workers * prefill engine GPUs + decode_workers * decode "
+                    "engine GPUs (TP * PP * DP): "
                     f"configured={configured_gpus}, expected={expected_gpus}"
                 )
         refit_transport = extra.get("refit_transport")

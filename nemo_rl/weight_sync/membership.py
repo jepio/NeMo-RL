@@ -35,13 +35,18 @@ class RefitMembership:
             the broadcast root (rank 0) stable across a rebuild.
         shard_prefixes: surviving shard index -> its rank prefix within the generation
             block. Insertion-ordered by shard index.
-        workers_per_shard: Ray workers backing one shard (tp x pp).
+        workers_per_shard: Ray workers backing one shard (tp x pp). With shards of
+            different sizes this is the size of the first shard; use
+            ``workers_by_shard`` for the others.
+        workers_by_shard: Ray workers of every shard, by shard index. None when all
+            shards have ``workers_per_shard`` workers.
     """
 
     world_size: int
     train_world_size: int
     shard_prefixes: dict[int, int]
     workers_per_shard: int
+    workers_by_shard: tuple[int, ...] | None = None
 
     @property
     def surviving_shards(self) -> list[int]:
@@ -58,6 +63,7 @@ def desired_membership(
     dp_size: int,
     total_gen_workers: int,
     train_world_size: int,
+    workers_by_shard: Sequence[int] | None = None,
 ) -> RefitMembership:
     """The membership the refit communicator *should* have, given who is absent.
 
@@ -74,6 +80,7 @@ def desired_membership(
         dp_size=dp_size,
         total_gen_workers=total_gen_workers,
         train_world_size=train_world_size,
+        workers_by_shard=workers_by_shard,
     )
 
 
@@ -124,6 +131,7 @@ def plan_refit_membership(
     dp_size: int,
     total_gen_workers: int,
     train_world_size: int,
+    workers_by_shard: Sequence[int] | None = None,
 ) -> RefitMembership:
     """Lay out a refit communicator containing only the surviving generation shards.
 
@@ -141,6 +149,9 @@ def plan_refit_membership(
         dp_size: generation data-parallel size, i.e. the shard count.
         total_gen_workers: Ray workers across the whole generation fleet.
         train_world_size: training ranks, all of which stay in the communicator.
+        workers_by_shard: Ray workers of each shard, when the shards differ in size
+            (a prefill/decode fleet with different engine shapes). None means that
+            every shard has ``total_gen_workers // dp_size`` workers.
 
     Raises:
         NoSurvivingShards: if nothing survives.
@@ -148,11 +159,20 @@ def plan_refit_membership(
     """
     if dp_size <= 0:
         raise ValueError(f"dp_size must be positive, got {dp_size}")
-    if total_gen_workers % dp_size != 0:
-        raise ValueError(
-            f"generation fleet is not evenly sharded: {total_gen_workers} workers "
-            f"across dp_size={dp_size}"
-        )
+    if workers_by_shard is None:
+        if total_gen_workers % dp_size != 0:
+            raise ValueError(
+                f"generation fleet is not evenly sharded: {total_gen_workers} workers "
+                f"across dp_size={dp_size}"
+            )
+        sizes = (total_gen_workers // dp_size,) * dp_size
+    else:
+        sizes = tuple(workers_by_shard)
+        if len(sizes) != dp_size or sum(sizes) != total_gen_workers:
+            raise ValueError(
+                f"workers_by_shard={sizes} does not match dp_size={dp_size} and "
+                f"total_gen_workers={total_gen_workers}"
+            )
 
     unique = sorted(set(surviving_shards))
     if not unique:
@@ -165,13 +185,15 @@ def plan_refit_membership(
             f"shard indices {out_of_range} are outside the fleet (dp_size={dp_size})"
         )
 
-    workers_per_shard = total_gen_workers // dp_size
-    prefixes = {
-        shard: position * workers_per_shard for position, shard in enumerate(unique)
-    }
+    prefixes: dict[int, int] = {}
+    next_prefix = 0
+    for shard in unique:
+        prefixes[shard] = next_prefix
+        next_prefix += sizes[shard]
     return RefitMembership(
-        world_size=train_world_size + len(unique) * workers_per_shard,
+        world_size=train_world_size + next_prefix,
         train_world_size=train_world_size,
         shard_prefixes=prefixes,
-        workers_per_shard=workers_per_shard,
+        workers_per_shard=sizes[unique[0]],
+        workers_by_shard=None if workers_by_shard is None else sizes,
     )

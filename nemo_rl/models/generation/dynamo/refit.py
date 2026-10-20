@@ -154,6 +154,7 @@ class DynamoRefitChannel:
         control_timeout_s: float,
         validate_workers: Callable[[list[dict[str, Any]]], list[dict[str, Any]]]
         | None = None,
+        engine_world_sizes: Sequence[int] | None = None,
     ) -> None:
         self._worker_metadata = [
             dict(worker) for worker in workers if isinstance(worker, dict)
@@ -167,6 +168,18 @@ class DynamoRefitChannel:
         if not self._workers:
             raise ValueError("Dynamo refit requires at least one worker endpoint")
         self._engine_world_size = engine_world_size
+        # The ranks of each engine, in worker order. Engines of one role share a
+        # shape, and the roles may differ.
+        self._engine_world_sizes = (
+            tuple(engine_world_sizes)
+            if engine_world_sizes is not None
+            else (engine_world_size,) * len(self._workers)
+        )
+        if len(self._engine_world_sizes) != len(self._workers):
+            raise ValueError(
+                f"{len(self._engine_world_sizes)} engine sizes for "
+                f"{len(self._workers)} Dynamo workers"
+            )
         self._control_timeout_s = control_timeout_s
         self._validate_workers = validate_workers
 
@@ -176,6 +189,7 @@ class DynamoRefitChannel:
             self._workers,
             engine_world_size=self._engine_world_size,
             control_timeout_s=self._control_timeout_s,
+            engine_world_sizes=self._engine_world_sizes,
         )
 
     def _validated_workers(self) -> tuple[DynamoWorkerEndpoint, ...]:
@@ -191,7 +205,12 @@ class DynamoRefitChannel:
 
     @property
     def inference_world_size(self) -> int:
-        return len(self._workers) * self._engine_world_size
+        return sum(self._engine_world_sizes)
+
+    @property
+    def engine_world_sizes(self) -> tuple[int, ...]:
+        """The refit ranks of each engine, in worker order."""
+        return self._engine_world_sizes
 
     @property
     def num_engines(self) -> int:
@@ -203,17 +222,19 @@ class DynamoRefitChannel:
 
     def check_full_fleet(self, membership: RefitMembership) -> None:
         """Reject any membership but every engine, in order: the fleet is fixed."""
-        full_fleet = {
-            index: index * self._engine_world_size for index in range(self.num_engines)
-        }
+        full_fleet: dict[int, int] = {}
+        next_prefix = 0
+        for index, size in enumerate(self._engine_world_sizes):
+            full_fleet[index] = next_prefix
+            next_prefix += size
         if (
             membership.shard_prefixes != full_fleet
-            or membership.workers_per_shard != self._engine_world_size
+            or membership.workers_per_shard != self._engine_world_sizes[0]
         ):
             raise NotImplementedError(
                 "Managed Dynamo has a fixed worker fleet; refit membership must be "
-                f"every engine {full_fleet} with {self._engine_world_size} ranks "
-                f"each, got {membership.shard_prefixes} with "
+                f"every engine {full_fleet} with {self._engine_world_sizes} ranks, "
+                f"got {membership.shard_prefixes} with "
                 f"{membership.workers_per_shard}."
             )
 
@@ -259,11 +280,13 @@ class DynamoRefitChannel:
 
     def full_fleet_membership(self, train_world_size: int) -> RefitMembership:
         """Every engine, each a DP shard of TP x PP ranks after the trainers."""
+        uniform = len(set(self._engine_world_sizes)) == 1
         return desired_membership(
             absent_shards=[],
             dp_size=self.num_engines,
             total_gen_workers=self.inference_world_size,
             train_world_size=train_world_size,
+            workers_by_shard=None if uniform else self._engine_world_sizes,
         )
 
     def init_collective(

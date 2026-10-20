@@ -407,11 +407,25 @@ class RefitFleetShape:
     """How a generation backend's refit ranks divide into DP shards.
 
     Refit membership (``nemo_rl.weight_sync.membership``) tracks shards by index and
-    gives each a contiguous block of ``total_gen_workers // dp_size`` ranks.
+    gives each a contiguous block of ``total_gen_workers // dp_size`` ranks, or of
+    ``workers_by_shard[i]`` ranks when the shards differ in size.
+
+    Attributes:
+        dp_size: number of shards.
+        total_gen_workers: refit ranks across all shards.
+        workers_by_shard: refit ranks of each shard, in rank order. None when every
+            shard has the same size.
+        layouts: the parallel layout of consecutive shards, in rank order, when it
+            is not the same for every shard. Each entry maps ``tp_size``,
+            ``ep_size``, ``etp_size``, ``pp_size`` and ``world_size`` (the refit ranks
+            of the shards that share the layout) to ints. None when every shard uses
+            the layout of the generation config.
     """
 
     dp_size: int
     total_gen_workers: int
+    workers_by_shard: tuple[int, ...] | None = None
+    layouts: tuple[dict[str, int], ...] | None = None
 
 
 def reject_unenforceable_refit_deadline(
